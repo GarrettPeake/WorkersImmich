@@ -10,6 +10,7 @@ import type { AuthDto } from 'src/dtos/auth.dto';
 import type { TimeBucketDto, TimeBucketAssetDto, TimeBucketsResponseDto, TimeBucketAssetResponseDto } from 'src/dtos/time-bucket.dto';
 import { AssetOrder, AssetType, AssetVisibility, Permission } from 'src/enum';
 import type { ServiceContext } from 'src/context';
+import { sql } from 'kysely';
 import { AccessRepository } from 'src/repositories/access.repository';
 import { requireAccess, requireElevatedPermission } from 'src/utils/access';
 import { BadRequestException } from 'src/utils/errors';
@@ -33,7 +34,7 @@ export class TimelineService {
     let query = this.db
       .selectFrom('asset')
       .select([
-        this.db.fn<string>('strftime', [this.db.val('%Y-%m-01'), 'asset.localDateTime']).as('timeBucket'),
+        this.db.fn<string>('strftime', [sql.val('%Y-%m-01'), 'asset.localDateTime']).as('timeBucket'),
       ])
       .select((eb) => eb.fn.countAll().as('count'))
       .where('asset.deletedAt', 'is', null);
@@ -67,8 +68,8 @@ export class TimelineService {
     }
 
     query = query
-      .groupBy(this.db.fn('strftime', [this.db.val('%Y-%m-01'), 'asset.localDateTime']))
-      .orderBy(this.db.fn('strftime', [this.db.val('%Y-%m-01'), 'asset.localDateTime']),
+      .groupBy(this.db.fn('strftime', [sql.val('%Y-%m-01'), 'asset.localDateTime']))
+      .orderBy(this.db.fn('strftime', [sql.val('%Y-%m-01'), 'asset.localDateTime']),
         order === AssetOrder.Asc ? 'asc' : 'desc');
 
     const rows = await query.execute();
@@ -110,7 +111,7 @@ export class TimelineService {
       ])
       .where('asset.deletedAt', 'is', null)
       .where(
-        this.db.fn<string>('strftime', [this.db.val('%Y-%m-01'), 'asset.localDateTime']),
+        this.db.fn<string>('strftime', [sql.val('%Y-%m-01'), 'asset.localDateTime']),
         '=',
         dto.timeBucket,
       );

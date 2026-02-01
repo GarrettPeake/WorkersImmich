@@ -9,6 +9,7 @@
 import type { AuthDto } from 'src/dtos/auth.dto';
 import { mapAsset, AssetResponseDto } from 'src/dtos/asset-response.dto';
 import type { ServiceContext } from 'src/context';
+import { sql } from 'kysely';
 
 export class ViewService {
   private get db() {
@@ -64,15 +65,15 @@ export class ViewService {
         this.db.fn<string>('replace', [
           this.db.fn<string>('substr', [
             'asset.originalPath',
-            this.db.val(normalizedPath.length + 1),
+            sql.val(normalizedPath.length + 1),
           ]),
-          this.db.val('/'),
-          this.db.val(''),
+          sql.val('/'),
+          sql.val(''),
         ]),
         '=',
         this.db.fn<string>('substr', [
           'asset.originalPath',
-          this.db.val(normalizedPath.length + 1),
+          sql.val(normalizedPath.length + 1),
         ]),
       )
       .orderBy('asset.fileCreatedAt', 'desc')
