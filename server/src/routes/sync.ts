@@ -45,7 +45,9 @@ app.post(
     const auth = c.get('auth');
     const services = c.get('services');
     const body = await c.req.json();
+    console.log(`[sync-route] POST /stream: userId=${auth.user.id}, body=${JSON.stringify(body)}`);
     const response = await services.sync.stream(auth, body);
+    console.log(`[sync-route] POST /stream: returning response status=${response.status}`);
     return response;
   },
 );
