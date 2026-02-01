@@ -120,10 +120,10 @@ export class ServerService {
       : false;
 
     return {
-      loginPageMessage: '',
+      loginPageMessage: "Garrett Peake's immich",
       trashDays: 30,
       userDeleteDelay: 7,
-      oauthButtonText: 'Login with OAuth',
+      oauthButtonText: 'OAuth Not Supported',
       isInitialized: hasAdmin,
       isOnboarded,
       externalDomain: '',
