@@ -33,6 +33,12 @@ type SyncAck = {
 };
 type CheckpointMap = Partial<Record<SyncEntityType, SyncAck>>;
 
+type SyncWriter = {
+  write: (data: string) => Promise<void>;
+  close: () => Promise<void>;
+  abort: (err: any) => Promise<void>;
+};
+
 const COMPLETE_ID = 'complete';
 const MAX_DAYS = 30;
 
@@ -64,7 +70,7 @@ export const SYNC_TYPES_ORDER = [
 /**
  * Create a JSON Lines streaming helper using Web Streams API.
  */
-function createJsonLinesStream() {
+function createJsonLinesStream(): SyncWriter & { readable: ReadableStream<Uint8Array> } {
   const encoder = new TextEncoder();
   const { readable, writable } = new TransformStream<Uint8Array>();
   const writer = writable.getWriter();
@@ -103,14 +109,17 @@ export class SyncService {
       throw new ForbiddenException('Sync endpoints cannot be used with API keys');
     }
 
+    console.log(`[sync] setAcks: sessionId=${sessionId}, acks=${JSON.stringify(dto.acks)}`);
+
     const checkpoints: Record<string, { sessionId: string; type: string; ack: string }> = {};
     for (const ack of dto.acks) {
       const { type } = fromAck(ack);
       if (type === SyncEntityType.SyncResetV1) {
-        // Reset sync progress for this session
+        console.log(`[sync] setAcks: processing SyncResetV1 ack, clearing isPendingSyncReset for session=${sessionId}`);
+        // Clear the pending reset flag and delete checkpoints so next stream returns actual data
         await this.db
           .updateTable('session')
-          .set({ isPendingSyncReset: 1 })
+          .set({ isPendingSyncReset: 0 })
           .where('id', '=', sessionId)
           .execute();
         await this.db
@@ -145,6 +154,8 @@ export class SyncService {
         )
         .execute();
     }
+
+    console.log(`[sync] setAcks: stored ${Object.keys(checkpoints).length} checkpoints`);
   }
 
   async deleteAcks(auth: AuthDto, dto: SyncAckDeleteDto) {
@@ -152,6 +163,8 @@ export class SyncService {
     if (!sessionId) {
       throw new ForbiddenException('Sync endpoints cannot be used with API keys');
     }
+
+    console.log(`[sync] deleteAcks: sessionId=${sessionId}, types=${JSON.stringify(dto.types)}`);
 
     if (dto.types && dto.types.length > 0) {
       await this.db
@@ -177,12 +190,16 @@ export class SyncService {
       throw new ForbiddenException('Sync endpoints cannot be used with API keys');
     }
 
+    const startTime = Date.now();
+    console.log(`[sync] stream: sessionId=${session.id}, userId=${auth.user.id}, types=[${dto.types.join(',')}], reset=${dto.reset ?? false}`);
+
     const stream = createJsonLinesStream();
 
-    // Process sync in the background
+    // Process sync in the background (stream.readable is consumed by the Response)
     const processSync = async () => {
       try {
         if (dto.reset) {
+          console.log(`[sync] stream: reset requested, setting isPendingSyncReset=1 and clearing checkpoints`);
           await this.db
             .updateTable('session')
             .set({ isPendingSyncReset: 1 })
@@ -201,9 +218,12 @@ export class SyncService {
           .where('session.id', '=', session.id)
           .executeTakeFirst();
 
+        console.log(`[sync] stream: isPendingSyncReset=${sessionRow?.isPendingSyncReset}`);
+
         if (sessionRow?.isPendingSyncReset) {
-          stream.write(serialize({ type: SyncEntityType.SyncResetV1, ids: ['reset'], data: {} }));
-          stream.close();
+          console.log(`[sync] stream: sending SyncResetV1 (client must ack to clear reset flag)`);
+          await stream.write(serialize({ type: SyncEntityType.SyncResetV1, ids: ['reset'], data: {} }));
+          await stream.close();
           return;
         }
 
@@ -219,25 +239,33 @@ export class SyncService {
           checkpointMap[cp.type as SyncEntityType] = fromAck(cp.ack);
         }
 
+        console.log(`[sync] stream: loaded ${checkpoints.length} checkpoints: [${checkpoints.map(cp => cp.type).join(', ')}]`);
+
         // Check if full sync is needed (complete ack is too old)
         if (this.needsFullSync(checkpointMap)) {
-          stream.write(serialize({ type: SyncEntityType.SyncResetV1, ids: ['reset'], data: {} }));
-          stream.close();
+          console.log(`[sync] stream: checkpoints too old (>${MAX_DAYS} days), sending SyncResetV1`);
+          await stream.write(serialize({ type: SyncEntityType.SyncResetV1, ids: ['reset'], data: {} }));
+          await stream.close();
           return;
         }
 
         const nowId = crypto.randomUUID();
+        let totalItemsStreamed = 0;
 
         // Process requested sync types in order
         for (const type of SYNC_TYPES_ORDER.filter((t) => dto.types.includes(t))) {
-          await this.handleSyncType(type, auth, checkpointMap, nowId, stream);
+          const count = await this.handleSyncType(type, auth, checkpointMap, nowId, stream);
+          totalItemsStreamed += count;
         }
 
         // Send completion
-        stream.write(serialize({ type: SyncEntityType.SyncCompleteV1, ids: [nowId], data: {} }));
-        stream.close();
+        await stream.write(serialize({ type: SyncEntityType.SyncCompleteV1, ids: [nowId], data: {} }));
+        await stream.close();
+
+        const elapsed = Date.now() - startTime;
+        console.log(`[sync] stream: completed in ${elapsed}ms, streamed ${totalItemsStreamed} items, nowId=${nowId}`);
       } catch (err) {
-        console.error('Sync stream error:', err);
+        console.error('[sync] stream: error during sync processing:', err);
         stream.abort(err);
       }
     };
@@ -254,6 +282,8 @@ export class SyncService {
    */
   async getFullSync(auth: AuthDto, dto: AssetFullSyncDto): Promise<AssetResponseDto[]> {
     const userId = dto.userId || auth.user.id;
+
+    console.log(`[sync] getFullSync: userId=${userId}, limit=${dto.limit}, lastId=${dto.lastId ?? 'none'}`);
 
     const updatedUntil = dto.updatedUntil instanceof Date
       ? dto.updatedUntil.toISOString()
@@ -272,6 +302,7 @@ export class SyncService {
     }
 
     const assets = await query.execute();
+    console.log(`[sync] getFullSync: returning ${assets.length} assets`);
     return assets.map((a: any) => mapAsset(a, { auth, stripMetadata: false, withStack: true }));
   }
 
@@ -283,9 +314,12 @@ export class SyncService {
       ? dto.updatedAfter
       : new Date(dto.updatedAfter);
 
+    console.log(`[sync] getDeltaSync: userIds=[${dto.userIds.join(',')}], updatedAfter=${updatedAfter.toISOString()}`);
+
     // Check if sync is too old
     const daysSinceSync = (Date.now() - updatedAfter.getTime()) / (1000 * 60 * 60 * 24);
     if (daysSinceSync > 100) {
+      console.log(`[sync] getDeltaSync: sync too old (${Math.round(daysSinceSync)} days), returning needsFullSync`);
       return FULL_SYNC;
     }
 
@@ -303,6 +337,7 @@ export class SyncService {
       .execute();
 
     if (upserted.length === limit) {
+      console.log(`[sync] getDeltaSync: hit limit (${limit}), returning needsFullSync`);
       return FULL_SYNC;
     }
 
@@ -314,7 +349,7 @@ export class SyncService {
       .where('asset_audit.deletedAt', '>', updatedAfterIso)
       .execute();
 
-    return {
+    const result = {
       needsFullSync: false,
       upserted: upserted
         .filter(
@@ -331,6 +366,9 @@ export class SyncService {
         ),
       deleted: deleted.map((d) => d.assetId),
     };
+
+    console.log(`[sync] getDeltaSync: returning ${result.upserted.length} upserted, ${result.deleted.length} deleted`);
+    return result;
   }
 
   // ---------------------------------------------------------------------------
@@ -343,27 +381,36 @@ export class SyncService {
       return false;
     }
 
-    // Extract timestamp from UUID v7 (first 12 hex chars = 48 bits of timestamp)
+    // Extract timestamp from the updateId (first 12 hex chars = millisecond timestamp)
+    // Works with both UUID v7 format and our trigger-generated hex timestamp format
     const hexStr = completeAck.updateId.replaceAll('-', '').slice(0, 12);
     const milliseconds = Number.parseInt(hexStr, 16);
     const ackDate = new Date(milliseconds);
     const maxAge = MAX_DAYS * 24 * 60 * 60 * 1000;
 
-    return (Date.now() - ackDate.getTime()) > maxAge;
+    const tooOld = (Date.now() - ackDate.getTime()) > maxAge;
+    if (tooOld) {
+      console.log(`[sync] needsFullSync: complete ack from ${ackDate.toISOString()} is older than ${MAX_DAYS} days`);
+    }
+    return tooOld;
   }
 
+  /**
+   * Handle a single sync type. Returns the number of items streamed.
+   */
   private async handleSyncType(
     type: SyncRequestType,
     auth: AuthDto,
     checkpointMap: CheckpointMap,
     nowId: string,
-    stream: { write: (data: string) => void },
-  ) {
+    stream: SyncWriter,
+  ): Promise<number> {
     const userId = auth.user.id;
+    let count = 0;
 
     switch (type) {
       case SyncRequestType.AuthUsersV1:
-        await this.syncSimpleUpsert(stream, 'user', SyncEntityType.AuthUserV1, checkpointMap, {
+        count = await this.syncSimpleUpsert(stream, 'user', SyncEntityType.AuthUserV1, checkpointMap, {
           ownerFilter: userId,
           mapRow: (row: any) => ({
             id: row.id,
@@ -385,11 +432,11 @@ export class SyncService {
 
       case SyncRequestType.UsersV1:
         // Deletes
-        await this.syncAuditDeletes(stream, 'user_audit', SyncEntityType.UserDeleteV1, checkpointMap, {
+        count += await this.syncAuditDeletes(stream, 'user_audit', SyncEntityType.UserDeleteV1, checkpointMap, {
           mapRow: (row: any) => ({ userId: row.userId }),
         });
         // Upserts
-        await this.syncSimpleUpsert(stream, 'user', SyncEntityType.UserV1, checkpointMap, {
+        count += await this.syncSimpleUpsert(stream, 'user', SyncEntityType.UserV1, checkpointMap, {
           mapRow: (row: any) => ({
             id: row.id,
             name: row.name,
@@ -403,11 +450,11 @@ export class SyncService {
         break;
 
       case SyncRequestType.PartnersV1:
-        await this.syncAuditDeletes(stream, 'partner_audit', SyncEntityType.PartnerDeleteV1, checkpointMap, {
+        count += await this.syncAuditDeletes(stream, 'partner_audit', SyncEntityType.PartnerDeleteV1, checkpointMap, {
           ownerFilter: userId,
           mapRow: (row: any) => ({ sharedById: row.sharedById, sharedWithId: row.sharedWithId }),
         });
-        await this.syncSimpleUpsert(stream, 'partner', SyncEntityType.PartnerV1, checkpointMap, {
+        count += await this.syncSimpleUpsert(stream, 'partner', SyncEntityType.PartnerV1, checkpointMap, {
           ownerFilter: userId,
           ownerColumn: 'sharedWithId',
           mapRow: (row: any) => ({
@@ -419,27 +466,27 @@ export class SyncService {
         break;
 
       case SyncRequestType.AssetsV1:
-        await this.syncAuditDeletes(stream, 'asset_audit', SyncEntityType.AssetDeleteV1, checkpointMap, {
+        count += await this.syncAuditDeletes(stream, 'asset_audit', SyncEntityType.AssetDeleteV1, checkpointMap, {
           ownerFilter: userId,
           mapRow: (row: any) => ({ assetId: row.assetId }),
         });
-        await this.syncSimpleUpsert(stream, 'asset', SyncEntityType.AssetV1, checkpointMap, {
+        count += await this.syncSimpleUpsert(stream, 'asset', SyncEntityType.AssetV1, checkpointMap, {
           ownerFilter: userId,
           mapRow: (row: any) => this.mapSyncAsset(row),
         });
         break;
 
       case SyncRequestType.AssetExifsV1:
-        await this.syncExifUpserts(stream, SyncEntityType.AssetExifV1, checkpointMap, userId);
+        count = await this.syncExifUpserts(stream, SyncEntityType.AssetExifV1, checkpointMap, userId);
         break;
 
       case SyncRequestType.StacksV1:
-        await this.syncAuditDeletes(stream, 'stack_audit', SyncEntityType.StackDeleteV1, checkpointMap, {
+        count += await this.syncAuditDeletes(stream, 'stack_audit', SyncEntityType.StackDeleteV1, checkpointMap, {
           ownerFilter: userId,
           ownerColumn: 'userId',
           mapRow: (row: any) => ({ stackId: row.stackId }),
         });
-        await this.syncSimpleUpsert(stream, 'stack', SyncEntityType.StackV1, checkpointMap, {
+        count += await this.syncSimpleUpsert(stream, 'stack', SyncEntityType.StackV1, checkpointMap, {
           ownerFilter: userId,
           mapRow: (row: any) => ({
             id: row.id,
@@ -452,37 +499,37 @@ export class SyncService {
         break;
 
       case SyncRequestType.AlbumsV1:
-        await this.syncAuditDeletes(stream, 'album_audit', SyncEntityType.AlbumDeleteV1, checkpointMap, {
+        count += await this.syncAuditDeletes(stream, 'album_audit', SyncEntityType.AlbumDeleteV1, checkpointMap, {
           ownerFilter: userId,
           ownerColumn: 'userId',
           mapRow: (row: any) => ({ albumId: row.albumId }),
         });
-        await this.syncAlbumUpserts(stream, checkpointMap, userId);
+        count += await this.syncAlbumUpserts(stream, checkpointMap, userId);
         break;
 
       case SyncRequestType.AlbumUsersV1:
-        await this.syncAuditDeletes(stream, 'album_user_audit', SyncEntityType.AlbumUserDeleteV1, checkpointMap, {
+        count += await this.syncAuditDeletes(stream, 'album_user_audit', SyncEntityType.AlbumUserDeleteV1, checkpointMap, {
           ownerFilter: userId,
           ownerColumn: 'userId',
           mapRow: (row: any) => ({ albumId: row.albumId, userId: row.userId }),
         });
-        await this.syncAlbumUserUpserts(stream, checkpointMap, userId);
+        count += await this.syncAlbumUserUpserts(stream, checkpointMap, userId);
         break;
 
       case SyncRequestType.AlbumToAssetsV1:
-        await this.syncAuditDeletes(stream, 'album_asset_audit', SyncEntityType.AlbumToAssetDeleteV1, checkpointMap, {
+        count += await this.syncAuditDeletes(stream, 'album_asset_audit', SyncEntityType.AlbumToAssetDeleteV1, checkpointMap, {
           mapRow: (row: any) => ({ albumId: row.albumId, assetId: row.assetId }),
         });
-        await this.syncAlbumToAssetUpserts(stream, checkpointMap, userId);
+        count += await this.syncAlbumToAssetUpserts(stream, checkpointMap, userId);
         break;
 
       case SyncRequestType.MemoriesV1:
-        await this.syncAuditDeletes(stream, 'memory_audit', SyncEntityType.MemoryDeleteV1, checkpointMap, {
+        count += await this.syncAuditDeletes(stream, 'memory_audit', SyncEntityType.MemoryDeleteV1, checkpointMap, {
           ownerFilter: userId,
           ownerColumn: 'userId',
           mapRow: (row: any) => ({ memoryId: row.memoryId }),
         });
-        await this.syncSimpleUpsert(stream, 'memory', SyncEntityType.MemoryV1, checkpointMap, {
+        count += await this.syncSimpleUpsert(stream, 'memory', SyncEntityType.MemoryV1, checkpointMap, {
           ownerFilter: userId,
           mapRow: (row: any) => ({
             id: row.id,
@@ -502,23 +549,23 @@ export class SyncService {
         break;
 
       case SyncRequestType.MemoryToAssetsV1:
-        await this.syncAuditDeletes(stream, 'memory_asset_audit', SyncEntityType.MemoryToAssetDeleteV1, checkpointMap, {
+        count += await this.syncAuditDeletes(stream, 'memory_asset_audit', SyncEntityType.MemoryToAssetDeleteV1, checkpointMap, {
           mapRow: (row: any) => ({ memoryId: row.memoryId, assetId: row.assetId }),
         });
-        await this.syncMemoryAssetUpserts(stream, checkpointMap, userId);
+        count += await this.syncMemoryAssetUpserts(stream, checkpointMap, userId);
         break;
 
       case SyncRequestType.UserMetadataV1:
-        await this.syncAuditDeletes(stream, 'user_metadata_audit', SyncEntityType.UserMetadataDeleteV1, checkpointMap, {
+        count += await this.syncAuditDeletes(stream, 'user_metadata_audit', SyncEntityType.UserMetadataDeleteV1, checkpointMap, {
           ownerFilter: userId,
           ownerColumn: 'userId',
           mapRow: (row: any) => ({ userId: row.userId, key: row.key }),
         });
-        await this.syncUserMetadataUpserts(stream, checkpointMap, userId);
+        count += await this.syncUserMetadataUpserts(stream, checkpointMap, userId);
         break;
 
       case SyncRequestType.AssetMetadataV1:
-        await this.syncAssetMetadata(stream, checkpointMap, auth);
+        count = await this.syncAssetMetadata(stream, checkpointMap, auth);
         break;
 
       // Stubbed sync types (features removed in Workers)
@@ -539,13 +586,20 @@ export class SyncService {
         // The basic sync for these entity types through their parent types is sufficient
         break;
     }
+
+    if (count > 0) {
+      console.log(`[sync] handleSyncType: ${type} streamed ${count} items`);
+    }
+
+    return count;
   }
 
   /**
    * Generic simple upsert sync from a table with updateId column.
+   * Returns the number of items streamed.
    */
   private async syncSimpleUpsert(
-    stream: { write: (data: string) => void },
+    stream: SyncWriter,
     tableName: string,
     entityType: SyncEntityType,
     checkpointMap: CheckpointMap,
@@ -554,7 +608,7 @@ export class SyncService {
       ownerColumn?: string;
       mapRow: (row: any) => any;
     },
-  ) {
+  ): Promise<number> {
     const checkpoint = checkpointMap[entityType];
     const ownerColumn = options.ownerColumn || 'ownerId';
 
@@ -573,18 +627,25 @@ export class SyncService {
 
     const rows = await query.limit(1000).execute();
 
+    if (rows.length > 0) {
+      console.log(`[sync] syncSimpleUpsert(${tableName}, ${entityType}): checkpoint=${checkpoint?.updateId ?? 'none'}, found ${rows.length} rows`);
+    }
+
     for (const row of rows) {
       const data = options.mapRow(row);
       const updateId = (row as any).updateId;
-      stream.write(serialize({ type: entityType, ids: [updateId], data }));
+      await stream.write(serialize({ type: entityType, ids: [updateId], data }));
     }
+
+    return rows.length;
   }
 
   /**
    * Generic audit table deletes sync.
+   * Returns the number of items streamed.
    */
   private async syncAuditDeletes(
-    stream: { write: (data: string) => void },
+    stream: SyncWriter,
     auditTable: string,
     entityType: SyncEntityType,
     checkpointMap: CheckpointMap,
@@ -593,7 +654,7 @@ export class SyncService {
       ownerColumn?: string;
       mapRow: (row: any) => any;
     },
-  ) {
+  ): Promise<number> {
     const checkpoint = checkpointMap[entityType];
 
     let query = this.db
@@ -611,18 +672,24 @@ export class SyncService {
 
     const rows = await query.limit(1000).execute();
 
+    if (rows.length > 0) {
+      console.log(`[sync] syncAuditDeletes(${auditTable}, ${entityType}): checkpoint=${checkpoint?.updateId ?? 'none'}, found ${rows.length} deletes`);
+    }
+
     for (const row of rows) {
       const data = options.mapRow(row);
-      stream.write(serialize({ type: entityType, ids: [(row as any).id], data }));
+      await stream.write(serialize({ type: entityType, ids: [(row as any).id], data }));
     }
+
+    return rows.length;
   }
 
   private async syncExifUpserts(
-    stream: { write: (data: string) => void },
+    stream: SyncWriter,
     entityType: SyncEntityType,
     checkpointMap: CheckpointMap,
     userId: string,
-  ) {
+  ): Promise<number> {
     const checkpoint = checkpointMap[entityType];
 
     let query = this.db
@@ -638,21 +705,27 @@ export class SyncService {
 
     const rows = await query.limit(1000).execute();
 
+    if (rows.length > 0) {
+      console.log(`[sync] syncExifUpserts(${entityType}): checkpoint=${checkpoint?.updateId ?? 'none'}, found ${rows.length} rows`);
+    }
+
     for (const row of rows) {
       const { updateId, assetId, ...data } = row as any;
-      stream.write(serialize({
+      await stream.write(serialize({
         type: entityType,
         ids: [updateId],
         data: { assetId, ...data },
       }));
     }
+
+    return rows.length;
   }
 
   private async syncAlbumUpserts(
-    stream: { write: (data: string) => void },
+    stream: SyncWriter,
     checkpointMap: CheckpointMap,
     userId: string,
-  ) {
+  ): Promise<number> {
     const entityType = SyncEntityType.AlbumV1;
     const checkpoint = checkpointMap[entityType];
 
@@ -679,8 +752,12 @@ export class SyncService {
 
     const rows = await query.limit(1000).execute();
 
+    if (rows.length > 0) {
+      console.log(`[sync] syncAlbumUpserts: checkpoint=${checkpoint?.updateId ?? 'none'}, found ${rows.length} albums`);
+    }
+
     for (const row of rows) {
-      stream.write(serialize({
+      await stream.write(serialize({
         type: entityType,
         ids: [(row as any).updateId],
         data: {
@@ -696,13 +773,15 @@ export class SyncService {
         },
       }));
     }
+
+    return rows.length;
   }
 
   private async syncAlbumUserUpserts(
-    stream: { write: (data: string) => void },
+    stream: SyncWriter,
     checkpointMap: CheckpointMap,
     userId: string,
-  ) {
+  ): Promise<number> {
     const entityType = SyncEntityType.AlbumUserV1;
     const checkpoint = checkpointMap[entityType];
 
@@ -725,7 +804,7 @@ export class SyncService {
     const rows = await query.limit(1000).execute();
 
     for (const row of rows) {
-      stream.write(serialize({
+      await stream.write(serialize({
         type: entityType,
         ids: [(row as any).updateId],
         data: {
@@ -735,13 +814,15 @@ export class SyncService {
         },
       }));
     }
+
+    return rows.length;
   }
 
   private async syncAlbumToAssetUpserts(
-    stream: { write: (data: string) => void },
+    stream: SyncWriter,
     checkpointMap: CheckpointMap,
     userId: string,
-  ) {
+  ): Promise<number> {
     const entityType = SyncEntityType.AlbumToAssetV1;
     const checkpoint = checkpointMap[entityType];
 
@@ -769,7 +850,7 @@ export class SyncService {
     const rows = await query.limit(1000).execute();
 
     for (const row of rows) {
-      stream.write(serialize({
+      await stream.write(serialize({
         type: entityType,
         ids: [(row as any).updateId],
         data: {
@@ -778,13 +859,15 @@ export class SyncService {
         },
       }));
     }
+
+    return rows.length;
   }
 
   private async syncMemoryAssetUpserts(
-    stream: { write: (data: string) => void },
+    stream: SyncWriter,
     checkpointMap: CheckpointMap,
     userId: string,
-  ) {
+  ): Promise<number> {
     const entityType = SyncEntityType.MemoryToAssetV1;
     const checkpoint = checkpointMap[entityType];
 
@@ -802,7 +885,7 @@ export class SyncService {
     const rows = await query.limit(1000).execute();
 
     for (const row of rows) {
-      stream.write(serialize({
+      await stream.write(serialize({
         type: entityType,
         ids: [(row as any).updateId],
         data: {
@@ -811,13 +894,15 @@ export class SyncService {
         },
       }));
     }
+
+    return rows.length;
   }
 
   private async syncUserMetadataUpserts(
-    stream: { write: (data: string) => void },
+    stream: SyncWriter,
     checkpointMap: CheckpointMap,
     userId: string,
-  ) {
+  ): Promise<number> {
     const entityType = SyncEntityType.UserMetadataV1;
     const checkpoint = checkpointMap[entityType];
 
@@ -834,7 +919,7 @@ export class SyncService {
     const rows = await query.limit(1000).execute();
 
     for (const row of rows) {
-      stream.write(serialize({
+      await stream.write(serialize({
         type: entityType,
         ids: [(row as any).updateId],
         data: {
@@ -844,14 +929,17 @@ export class SyncService {
         },
       }));
     }
+
+    return rows.length;
   }
 
   private async syncAssetMetadata(
-    stream: { write: (data: string) => void },
+    stream: SyncWriter,
     checkpointMap: CheckpointMap,
     auth: AuthDto,
-  ) {
+  ): Promise<number> {
     const userId = auth.user.id;
+    let count = 0;
 
     // Deletes
     const deleteType = SyncEntityType.AssetMetadataDeleteV1;
@@ -871,12 +959,13 @@ export class SyncService {
 
     const deleteRows = await deleteQuery.limit(1000).execute();
     for (const row of deleteRows) {
-      stream.write(serialize({
+      await stream.write(serialize({
         type: deleteType,
         ids: [(row as any).id],
         data: { assetId: (row as any).assetId, key: (row as any).key },
       }));
     }
+    count += deleteRows.length;
 
     // Upserts
     const upsertType = SyncEntityType.AssetMetadataV1;
@@ -895,7 +984,7 @@ export class SyncService {
 
     const upsertRows = await upsertQuery.limit(1000).execute();
     for (const row of upsertRows) {
-      stream.write(serialize({
+      await stream.write(serialize({
         type: upsertType,
         ids: [(row as any).updateId],
         data: {
@@ -905,6 +994,9 @@ export class SyncService {
         },
       }));
     }
+    count += upsertRows.length;
+
+    return count;
   }
 
   private mapSyncAsset(row: any) {
