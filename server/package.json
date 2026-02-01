@@ -3,7 +3,7 @@
   "version": "2.5.2",
   "license": "GNU Affero General Public License version 3",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --ip 0.0.0.0",
     "deploy": "wrangler deploy",
     "test": "vitest"
   },
