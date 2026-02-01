@@ -84,6 +84,9 @@ export class TimelineService {
     await this.timeBucketChecks(auth, dto);
     const { userIds, albumId, tagId, isFavorite, visibility, order } = this.buildOptions(auth, dto);
 
+    // Normalize timeBucket to YYYY-MM-01 format (frontend sends full ISO like 2025-01-01T00:00:00.000Z)
+    const timeBucket = dto.timeBucket.substring(0, 10);
+
     let query = this.db
       .selectFrom('asset')
       .leftJoin('asset_exif', 'asset_exif.assetId', 'asset.id')
@@ -113,7 +116,7 @@ export class TimelineService {
       .where(
         this.db.fn<string>('strftime', [sql.val('%Y-%m-01'), 'asset.localDateTime']),
         '=',
-        dto.timeBucket,
+        timeBucket,
       );
 
     if (userIds && userIds.length > 0) {
