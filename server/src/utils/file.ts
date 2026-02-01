@@ -1,87 +1,94 @@
-import { HttpException, StreamableFile } from '@nestjs/common';
-import { NextFunction, Response } from 'express';
-import { access, constants } from 'node:fs/promises';
-import { basename, extname } from 'node:path';
-import { promisify } from 'node:util';
-import { CacheControl } from 'src/enum';
-import { LoggingRepository } from 'src/repositories/logging.repository';
-import { ImmichReadStream } from 'src/repositories/storage.repository';
-import { isConnectionAborted } from 'src/utils/misc';
+/**
+ * File serving utilities for R2 objects.
+ *
+ * Uses standard Web API Response objects (no Express, no node:fs, no node:stream).
+ * Compatible with Hono's context and Cloudflare Workers runtime.
+ */
 
-export function getFileNameWithoutExtension(path: string): string {
-  return basename(path, extname(path));
-}
+import type { Context } from 'hono';
 
-export function getFilenameExtension(path: string): string {
-  return extname(path);
-}
+/**
+ * Serve an R2 object as an HTTP response with proper headers.
+ */
+export function serveR2Object(
+  c: Context,
+  object: R2ObjectBody,
+  options?: {
+    filename?: string;
+    inline?: boolean;
+    cacheControl?: string;
+  },
+): Response {
+  const headers = new Headers();
 
-export function getLivePhotoMotionFilename(stillName: string, motionName: string) {
-  return getFileNameWithoutExtension(stillName) + extname(motionName);
-}
+  // Write R2 object HTTP metadata (content-type, etc.)
+  object.writeHttpMetadata(headers);
 
-export class ImmichFileResponse {
-  public readonly path!: string;
-  public readonly contentType!: string;
-  public readonly cacheControl!: CacheControl;
-  public readonly fileName?: string;
+  // ETag
+  headers.set('ETag', object.httpEtag);
 
-  constructor(response: ImmichFileResponse) {
-    Object.assign(this, response);
+  // Cache control
+  if (options?.cacheControl) {
+    headers.set('Cache-Control', options.cacheControl);
   }
-}
-type SendFile = Parameters<Response['sendFile']>;
-type SendFileOptions = SendFile[1];
 
-const cacheControlHeaders: Record<CacheControl, string | null> = {
-  [CacheControl.PrivateWithCache]:
-    'private, max-age=86400, no-transform, stale-while-revalidate=2592000, stale-if-error=2592000',
-  [CacheControl.PrivateWithoutCache]: 'private, no-cache, no-transform',
-  [CacheControl.None]: null, // falsy value to prevent adding Cache-Control header
-};
-
-export const sendFile = async (
-  res: Response,
-  next: NextFunction,
-  handler: () => Promise<ImmichFileResponse> | ImmichFileResponse,
-  logger: LoggingRepository,
-): Promise<void> => {
-  // promisified version of 'res.sendFile' for cleaner async handling
-  const _sendFile = (path: string, options: SendFileOptions) =>
-    promisify<string, SendFileOptions>(res.sendFile).bind(res)(path, options);
-
-  try {
-    const file = await handler();
-    const cacheControlHeader = cacheControlHeaders[file.cacheControl];
-    if (cacheControlHeader) {
-      // set the header to Cache-Control
-      res.set('Cache-Control', cacheControlHeader);
-    }
-
-    res.header('Content-Type', file.contentType);
-    if (file.fileName) {
-      res.header('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(file.fileName)}`);
-    }
-
-    await access(file.path, constants.R_OK);
-
-    return await _sendFile(file.path, { dotfiles: 'allow' });
-  } catch (error: Error | any) {
-    // ignore client-closed connection
-    if (isConnectionAborted(error) || res.headersSent) {
-      return;
-    }
-
-    // log non-http errors
-    if (error instanceof HttpException === false) {
-      logger.error(`Unable to send file: ${error}`, error.stack);
-    }
-
-    res.header('Cache-Control', 'none');
-    next(error);
+  // Content disposition
+  if (options?.filename) {
+    const disposition = options.inline ? 'inline' : 'attachment';
+    headers.set('Content-Disposition', `${disposition}; filename="${options.filename}"`);
   }
-};
 
-export const asStreamableFile = ({ stream, type, length }: ImmichReadStream) => {
-  return new StreamableFile(stream, { type, length });
-};
+  // Content length
+  headers.set('Content-Length', object.size.toString());
+
+  return new Response(object.body, { headers });
+}
+
+/**
+ * Serve an R2 object with Range header support (for video streaming).
+ */
+export function serveR2ObjectWithRange(
+  c: Context,
+  object: R2ObjectBody,
+  totalSize: number,
+): Response {
+  const rangeHeader = c.req.header('Range');
+
+  if (!rangeHeader) {
+    return serveR2Object(c, object, {
+      cacheControl: 'private, max-age=86400',
+    });
+  }
+
+  // Parse Range header
+  const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+  if (!match) {
+    return new Response('Invalid Range', { status: 416 });
+  }
+
+  const start = parseInt(match[1], 10);
+  const end = match[2] ? parseInt(match[2], 10) : totalSize - 1;
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+  headers.set('Content-Length', (end - start + 1).toString());
+  headers.set('Accept-Ranges', 'bytes');
+
+  return new Response(object.body, {
+    status: 206,
+    headers,
+  });
+}
+
+/**
+ * Check if an R2 object exists and handle conditional requests (If-None-Match).
+ * Returns a 304 Not Modified response if the ETag matches, or null otherwise.
+ */
+export function handleConditionalRequest(c: Context, etag: string): Response | null {
+  const ifNoneMatch = c.req.header('If-None-Match');
+  if (ifNoneMatch && ifNoneMatch === etag) {
+    return new Response(null, { status: 304 });
+  }
+  return null;
+}

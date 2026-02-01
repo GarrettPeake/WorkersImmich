@@ -1,6 +1,13 @@
 import { AssetFace } from 'src/database';
-import { AssetOcrResponseDto } from 'src/dtos/ocr.dto';
 import { ImageDimensions } from 'src/types';
+
+/** Stub for removed OCR module */
+export interface AssetOcrResponseDto {
+  x1: number; y1: number; x2: number; y2: number;
+  x3: number; y3: number; x4: number; y4: number;
+  isVisible: boolean;
+  [key: string]: any;
+}
 
 type BoundingBox = {
   x1: number;

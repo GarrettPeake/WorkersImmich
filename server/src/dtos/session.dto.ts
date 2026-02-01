@@ -1,63 +1,45 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Equals, IsInt, IsPositive, IsString } from 'class-validator';
-import { Session } from 'src/database';
-import { Optional, ValidateBoolean } from 'src/validation';
+import { z } from 'zod';
+import type { Session } from 'src/database';
 
-export class SessionCreateDto {
-  @ApiPropertyOptional({ type: 'number', description: 'Session duration in seconds' })
-  @IsInt()
-  @IsPositive()
-  @Optional()
-  duration?: number;
+// --- Request Schemas ---
 
-  @ApiPropertyOptional({ description: 'Device type' })
-  @IsString()
-  @Optional()
-  deviceType?: string;
+export const SessionCreateSchema = z.object({
+  duration: z.number().int().positive().optional(),
+  deviceType: z.string().optional(),
+  deviceOS: z.string().optional(),
+});
+export type SessionCreateDto = z.infer<typeof SessionCreateSchema>;
 
-  @ApiPropertyOptional({ description: 'Device OS' })
-  @IsString()
-  @Optional()
-  deviceOS?: string;
-}
+export const SessionUpdateSchema = z.object({
+  isPendingSyncReset: z.literal(true).optional(),
+});
+export type SessionUpdateDto = z.infer<typeof SessionUpdateSchema>;
 
-export class SessionUpdateDto {
-  @ValidateBoolean({ optional: true, description: 'Reset pending sync state' })
-  @Equals(true)
-  isPendingSyncReset?: true;
-}
+// --- Response DTOs (plain interfaces) ---
 
-export class SessionResponseDto {
-  @ApiProperty({ description: 'Session ID' })
-  id!: string;
-  @ApiProperty({ description: 'Creation date' })
-  createdAt!: string;
-  @ApiProperty({ description: 'Last update date' })
-  updatedAt!: string;
-  @ApiPropertyOptional({ description: 'Expiration date' })
+export interface SessionResponseDto {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
   expiresAt?: string;
-  @ApiProperty({ description: 'Is current session' })
-  current!: boolean;
-  @ApiProperty({ description: 'Device type' })
-  deviceType!: string;
-  @ApiProperty({ description: 'Device OS' })
-  deviceOS!: string;
-  @ApiProperty({ description: 'App version' })
-  appVersion!: string | null;
-  @ApiProperty({ description: 'Is pending sync reset' })
-  isPendingSyncReset!: boolean;
+  current: boolean;
+  deviceType: string;
+  deviceOS: string;
+  appVersion: string | null;
+  isPendingSyncReset: boolean;
 }
 
-export class SessionCreateResponseDto extends SessionResponseDto {
-  @ApiProperty({ description: 'Session token' })
-  token!: string;
+export interface SessionCreateResponseDto extends SessionResponseDto {
+  token: string;
 }
+
+// --- Mapper ---
 
 export const mapSession = (entity: Session, currentId?: string): SessionResponseDto => ({
   id: entity.id,
-  createdAt: entity.createdAt.toISOString(),
-  updatedAt: entity.updatedAt.toISOString(),
-  expiresAt: entity.expiresAt?.toISOString(),
+  createdAt: entity.createdAt,   // Already ISO 8601 string in D1
+  updatedAt: entity.updatedAt,
+  expiresAt: entity.expiresAt ?? undefined,
   current: currentId === entity.id,
   appVersion: entity.appVersion,
   deviceOS: entity.deviceOS,

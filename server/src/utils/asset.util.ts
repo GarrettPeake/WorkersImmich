@@ -6,10 +6,8 @@ import { UploadFieldName } from 'src/dtos/asset-media.dto';
 import { AuthDto } from 'src/dtos/auth.dto';
 import { ExifResponseDto } from 'src/dtos/exif.dto';
 import { AssetFileType, AssetType, AssetVisibility, Permission } from 'src/enum';
-import { AuthRequest } from 'src/middleware/auth.guard';
 import { AccessRepository } from 'src/repositories/access.repository';
 import { AssetRepository } from 'src/repositories/asset.repository';
-import { EventRepository } from 'src/repositories/event.repository';
 import { PartnerRepository } from 'src/repositories/partner.repository';
 import { IBulkAsset, ImmichFile, UploadFile, UploadRequest } from 'src/types';
 import { checkAccess } from 'src/utils/access';
@@ -139,10 +137,10 @@ export const getMyPartnerIds = async ({ userId, repository, timelineEnabled }: P
   return [...partnerIds];
 };
 
-export type AssetHookRepositories = { asset: AssetRepository; event: EventRepository };
+export type AssetHookRepositories = { asset: AssetRepository };
 
 export const onBeforeLink = async (
-  { asset: assetRepository, event: eventRepository }: AssetHookRepositories,
+  { asset: assetRepository }: AssetHookRepositories,
   { userId, livePhotoVideoId }: { userId: string; livePhotoVideoId: string },
 ) => {
   const motionAsset = await assetRepository.getById(livePhotoVideoId);
@@ -158,7 +156,6 @@ export const onBeforeLink = async (
 
   if (motionAsset && motionAsset.visibility === AssetVisibility.Timeline) {
     await assetRepository.update({ id: livePhotoVideoId, visibility: AssetVisibility.Hidden });
-    await eventRepository.emit('AssetHide', { assetId: motionAsset.id, userId });
   }
 };
 
@@ -171,19 +168,14 @@ export const onBeforeUnlink = async (
     return null;
   }
 
-  if (StorageCore.isAndroidMotionPath(motion.originalPath)) {
-    throw new BadRequestException('Cannot unlink Android motion photos');
-  }
-
   return motion;
 };
 
 export const onAfterUnlink = async (
-  { asset: assetRepository, event: eventRepository }: AssetHookRepositories,
+  { asset: assetRepository }: AssetHookRepositories,
   { userId, livePhotoVideoId, visibility }: { userId: string; livePhotoVideoId: string; visibility: AssetVisibility },
 ) => {
   await assetRepository.update({ id: livePhotoVideoId, visibility });
-  await eventRepository.emit('AssetShow', { assetId: livePhotoVideoId, userId });
 };
 
 export function mapToUploadFile(file: ImmichFile): UploadFile {
@@ -196,12 +188,12 @@ export function mapToUploadFile(file: ImmichFile): UploadFile {
   };
 }
 
-export const asUploadRequest = (request: AuthRequest, file: Express.Multer.File): UploadRequest => {
+export const asUploadRequest = (request: { user?: any; body?: any }, file: { fieldname: string } & ImmichFile): UploadRequest => {
   return {
     auth: request.user || null,
     body: request.body,
     fieldName: file.fieldname as UploadFieldName,
-    file: mapToUploadFile(file as ImmichFile),
+    file: mapToUploadFile(file),
   };
 };
 

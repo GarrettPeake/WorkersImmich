@@ -1,7 +1,4 @@
-import { ApiExtraModels, ApiProperty, getSchemaPath } from '@nestjs/swagger';
-import { ClassConstructor, plainToInstance, Transform, Type } from 'class-transformer';
-import { ArrayMinSize, IsEnum, IsInt, Min, ValidateNested } from 'class-validator';
-import { IsAxisAlignedRotation, IsUniqueEditActions, ValidateUUID } from 'src/validation';
+import { z } from 'zod';
 
 export enum AssetEditAction {
   Crop = 'crop',
@@ -14,69 +11,29 @@ export enum MirrorAxis {
   Vertical = 'vertical',
 }
 
-export class CropParameters {
-  @IsInt()
-  @Min(0)
-  @ApiProperty({ description: 'Top-Left X coordinate of crop' })
-  x!: number;
+// --- Parameter Schemas ---
 
-  @IsInt()
-  @Min(0)
-  @ApiProperty({ description: 'Top-Left Y coordinate of crop' })
-  y!: number;
+export const CropParametersSchema = z.object({
+  x: z.number().int().min(0),
+  y: z.number().int().min(0),
+  width: z.number().int().min(1),
+  height: z.number().int().min(1),
+});
+export type CropParameters = z.infer<typeof CropParametersSchema>;
 
-  @IsInt()
-  @Min(1)
-  @ApiProperty({ description: 'Width of the crop' })
-  width!: number;
+export const RotateParametersSchema = z.object({
+  angle: z.number().refine((v) => [0, 90, 180, 270].includes(v), {
+    message: 'Angle must be one of: 0, 90, 180, 270',
+  }),
+});
+export type RotateParameters = z.infer<typeof RotateParametersSchema>;
 
-  @IsInt()
-  @Min(1)
-  @ApiProperty({ description: 'Height of the crop' })
-  height!: number;
-}
+export const MirrorParametersSchema = z.object({
+  axis: z.nativeEnum(MirrorAxis),
+});
+export type MirrorParameters = z.infer<typeof MirrorParametersSchema>;
 
-export class RotateParameters {
-  @IsAxisAlignedRotation()
-  @ApiProperty({ description: 'Rotation angle in degrees' })
-  angle!: number;
-}
-
-export class MirrorParameters {
-  @IsEnum(MirrorAxis)
-  @ApiProperty({ enum: MirrorAxis, enumName: 'MirrorAxis', description: 'Axis to mirror along' })
-  axis!: MirrorAxis;
-}
-
-class AssetEditActionBase {
-  @IsEnum(AssetEditAction)
-  @ApiProperty({ enum: AssetEditAction, enumName: 'AssetEditAction', description: 'Type of edit action to perform' })
-  action!: AssetEditAction;
-}
-
-export class AssetEditActionCrop extends AssetEditActionBase {
-  @ValidateNested()
-  @Type(() => CropParameters)
-  // Description lives on schema to avoid duplication
-  @ApiProperty({ description: undefined })
-  parameters!: CropParameters;
-}
-
-export class AssetEditActionRotate extends AssetEditActionBase {
-  @ValidateNested()
-  @Type(() => RotateParameters)
-  // Description lives on schema to avoid duplication
-  @ApiProperty({ description: undefined })
-  parameters!: RotateParameters;
-}
-
-export class AssetEditActionMirror extends AssetEditActionBase {
-  @ValidateNested()
-  @Type(() => MirrorParameters)
-  // Description lives on schema to avoid duplication
-  @ApiProperty({ description: undefined })
-  parameters!: MirrorParameters;
-}
+// --- Action Item Types ---
 
 export type AssetEditActionItem =
   | {
@@ -98,33 +55,46 @@ export type AssetEditActionParameter = {
   [AssetEditAction.Mirror]: MirrorParameters;
 };
 
-type AssetEditActions = AssetEditActionCrop | AssetEditActionRotate | AssetEditActionMirror;
-const actionToClass: Record<AssetEditAction, ClassConstructor<AssetEditActions>> = {
-  [AssetEditAction.Crop]: AssetEditActionCrop,
-  [AssetEditAction.Rotate]: AssetEditActionRotate,
-  [AssetEditAction.Mirror]: AssetEditActionMirror,
-} as const;
+// --- Edit Action Schemas ---
 
-const getActionClass = (item: { action: AssetEditAction }): ClassConstructor<AssetEditActions> =>
-  actionToClass[item.action];
+const AssetEditActionCropSchema = z.object({
+  action: z.literal(AssetEditAction.Crop),
+  parameters: CropParametersSchema,
+});
 
-@ApiExtraModels(AssetEditActionRotate, AssetEditActionMirror, AssetEditActionCrop)
-export class AssetEditActionListDto {
-  /** list of edits */
-  @ArrayMinSize(1)
-  @IsUniqueEditActions()
-  @ValidateNested({ each: true })
-  @Transform(({ value: edits }) =>
-    Array.isArray(edits) ? edits.map((item) => plainToInstance(getActionClass(item), item)) : edits,
-  )
-  @ApiProperty({
-    anyOf: Object.values(actionToClass).map((target) => ({ $ref: getSchemaPath(target) })),
-    description: 'List of edit actions to apply (crop, rotate, or mirror)',
-  })
-  edits!: AssetEditActionItem[];
-}
+const AssetEditActionRotateSchema = z.object({
+  action: z.literal(AssetEditAction.Rotate),
+  parameters: RotateParametersSchema,
+});
 
-export class AssetEditsDto extends AssetEditActionListDto {
-  @ValidateUUID({ description: 'Asset ID to apply edits to' })
-  assetId!: string;
-}
+const AssetEditActionMirrorSchema = z.object({
+  action: z.literal(AssetEditAction.Mirror),
+  parameters: MirrorParametersSchema,
+});
+
+const AssetEditActionSchema = z.discriminatedUnion('action', [
+  AssetEditActionCropSchema,
+  AssetEditActionRotateSchema,
+  AssetEditActionMirrorSchema,
+]);
+
+export const AssetEditActionListSchema = z.object({
+  edits: z.array(AssetEditActionSchema).min(1).refine(
+    (edits) => {
+      const actionSet = new Set<string>();
+      for (const edit of edits) {
+        const key = edit.action === 'mirror' ? `${edit.action}-${JSON.stringify(edit.parameters)}` : edit.action;
+        if (actionSet.has(key)) return false;
+        actionSet.add(key);
+      }
+      return true;
+    },
+    { message: 'Duplicate edit actions are not allowed' },
+  ),
+});
+export type AssetEditActionListDto = z.infer<typeof AssetEditActionListSchema>;
+
+export const AssetEditsSchema = AssetEditActionListSchema.extend({
+  assetId: z.string().uuid(),
+});
+export type AssetEditsDto = z.infer<typeof AssetEditsSchema>;

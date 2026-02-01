@@ -1,8 +1,6 @@
 import { RegisterQueueOptions } from '@nestjs/bullmq';
 import { Inject, Injectable, Optional } from '@nestjs/common';
 import { QueueOptions } from 'bullmq';
-import { plainToInstance } from 'class-transformer';
-import { validateSync } from 'class-validator';
 import { Request, Response } from 'express';
 import { RedisOptions } from 'ioredis';
 import { CLS_ID, ClsModuleOptions } from 'nestjs-cls';
@@ -10,7 +8,6 @@ import { OpenTelemetryModuleOptions } from 'nestjs-otel/lib/interfaces';
 import { join } from 'node:path';
 import { citiesFile, excludePaths, IWorker } from 'src/constants';
 import { Telemetry } from 'src/decorators';
-import { EnvDto } from 'src/dtos/env.dto';
 import {
   DatabaseExtension,
   ImmichEnvironment,
@@ -143,15 +140,9 @@ const asSet = <T>(value: string | undefined, defaults: T[]) => {
 };
 
 const getEnv = (): EnvData => {
-  const dto = plainToInstance(EnvDto, process.env);
-  const errors = validateSync(dto);
-  if (errors.length > 0) {
-    const messages = [`Invalid environment variables: `];
-    for (const error of errors) {
-      messages.push(`  - ${error.property}=${error.value} (${Object.values(error.constraints || {}).join(', ')})`);
-    }
-    throw new Error(messages.join('\n'));
-  }
+  const dto = process.env as Record<string, string | undefined> & {
+    [key: string]: any;
+  };
 
   const includedWorkers = asSet(dto.IMMICH_WORKERS_INCLUDE, [ImmichWorker.Api, ImmichWorker.Microservices]);
   const excludedWorkers = asSet(dto.IMMICH_WORKERS_EXCLUDE, []);

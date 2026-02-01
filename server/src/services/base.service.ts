@@ -10,37 +10,18 @@ import { ActivityRepository } from 'src/repositories/activity.repository';
 import { AlbumUserRepository } from 'src/repositories/album-user.repository';
 import { AlbumRepository } from 'src/repositories/album.repository';
 import { ApiKeyRepository } from 'src/repositories/api-key.repository';
-import { AppRepository } from 'src/repositories/app.repository';
 import { AssetEditRepository } from 'src/repositories/asset-edit.repository';
 import { AssetJobRepository } from 'src/repositories/asset-job.repository';
 import { AssetRepository } from 'src/repositories/asset.repository';
 import { AuditRepository } from 'src/repositories/audit.repository';
 import { ConfigRepository } from 'src/repositories/config.repository';
-import { CronRepository } from 'src/repositories/cron.repository';
 import { CryptoRepository } from 'src/repositories/crypto.repository';
-import { DatabaseRepository } from 'src/repositories/database.repository';
 import { DownloadRepository } from 'src/repositories/download.repository';
-import { DuplicateRepository } from 'src/repositories/duplicate.repository';
-import { EmailRepository } from 'src/repositories/email.repository';
-import { EventRepository } from 'src/repositories/event.repository';
-import { JobRepository } from 'src/repositories/job.repository';
-import { LibraryRepository } from 'src/repositories/library.repository';
 import { LoggingRepository } from 'src/repositories/logging.repository';
-import { MachineLearningRepository } from 'src/repositories/machine-learning.repository';
-import { MapRepository } from 'src/repositories/map.repository';
 import { MediaRepository } from 'src/repositories/media.repository';
 import { MemoryRepository } from 'src/repositories/memory.repository';
 import { MetadataRepository } from 'src/repositories/metadata.repository';
-import { MoveRepository } from 'src/repositories/move.repository';
-import { NotificationRepository } from 'src/repositories/notification.repository';
-import { OAuthRepository } from 'src/repositories/oauth.repository';
-import { OcrRepository } from 'src/repositories/ocr.repository';
 import { PartnerRepository } from 'src/repositories/partner.repository';
-import { PersonRepository } from 'src/repositories/person.repository';
-import { PluginRepository } from 'src/repositories/plugin.repository';
-import { ProcessRepository } from 'src/repositories/process.repository';
-import { SearchRepository } from 'src/repositories/search.repository';
-import { ServerInfoRepository } from 'src/repositories/server-info.repository';
 import { SessionRepository } from 'src/repositories/session.repository';
 import { SharedLinkAssetRepository } from 'src/repositories/shared-link-asset.repository';
 import { SharedLinkRepository } from 'src/repositories/shared-link.repository';
@@ -50,13 +31,9 @@ import { SyncCheckpointRepository } from 'src/repositories/sync-checkpoint.repos
 import { SyncRepository } from 'src/repositories/sync.repository';
 import { SystemMetadataRepository } from 'src/repositories/system-metadata.repository';
 import { TagRepository } from 'src/repositories/tag.repository';
-import { TelemetryRepository } from 'src/repositories/telemetry.repository';
 import { TrashRepository } from 'src/repositories/trash.repository';
 import { UserRepository } from 'src/repositories/user.repository';
-import { VersionHistoryRepository } from 'src/repositories/version-history.repository';
 import { ViewRepository } from 'src/repositories/view-repository';
-import { WebsocketRepository } from 'src/repositories/websocket.repository';
-import { WorkflowRepository } from 'src/repositories/workflow.repository';
 import { UserTable } from 'src/schema/tables/user.table';
 import { AccessRequest, checkAccess, requireAccess } from 'src/utils/access';
 import { getConfig, updateConfig } from 'src/utils/config';
@@ -68,36 +45,17 @@ export const BASE_SERVICE_DEPENDENCIES = [
   AlbumRepository,
   AlbumUserRepository,
   ApiKeyRepository,
-  AppRepository,
   AssetRepository,
   AssetEditRepository,
   AssetJobRepository,
   AuditRepository,
   ConfigRepository,
-  CronRepository,
   CryptoRepository,
-  DatabaseRepository,
   DownloadRepository,
-  DuplicateRepository,
-  EmailRepository,
-  EventRepository,
-  JobRepository,
-  LibraryRepository,
-  MachineLearningRepository,
-  MapRepository,
   MediaRepository,
   MemoryRepository,
   MetadataRepository,
-  MoveRepository,
-  NotificationRepository,
-  OAuthRepository,
-  OcrRepository,
   PartnerRepository,
-  PersonRepository,
-  PluginRepository,
-  ProcessRepository,
-  SearchRepository,
-  ServerInfoRepository,
   SessionRepository,
   SharedLinkRepository,
   SharedLinkAssetRepository,
@@ -107,13 +65,9 @@ export const BASE_SERVICE_DEPENDENCIES = [
   SyncCheckpointRepository,
   SystemMetadataRepository,
   TagRepository,
-  TelemetryRepository,
   TrashRepository,
   UserRepository,
-  VersionHistoryRepository,
   ViewRepository,
-  WebsocketRepository,
-  WorkflowRepository,
 ];
 
 @Injectable()
@@ -127,36 +81,17 @@ export class BaseService {
     protected albumRepository: AlbumRepository,
     protected albumUserRepository: AlbumUserRepository,
     protected apiKeyRepository: ApiKeyRepository,
-    protected appRepository: AppRepository,
     protected assetRepository: AssetRepository,
     protected assetEditRepository: AssetEditRepository,
     protected assetJobRepository: AssetJobRepository,
     protected auditRepository: AuditRepository,
     protected configRepository: ConfigRepository,
-    protected cronRepository: CronRepository,
     protected cryptoRepository: CryptoRepository,
-    protected databaseRepository: DatabaseRepository,
     protected downloadRepository: DownloadRepository,
-    protected duplicateRepository: DuplicateRepository,
-    protected emailRepository: EmailRepository,
-    protected eventRepository: EventRepository,
-    protected jobRepository: JobRepository,
-    protected libraryRepository: LibraryRepository,
-    protected machineLearningRepository: MachineLearningRepository,
-    protected mapRepository: MapRepository,
     protected mediaRepository: MediaRepository,
     protected memoryRepository: MemoryRepository,
     protected metadataRepository: MetadataRepository,
-    protected moveRepository: MoveRepository,
-    protected notificationRepository: NotificationRepository,
-    protected oauthRepository: OAuthRepository,
-    protected ocrRepository: OcrRepository,
     protected partnerRepository: PartnerRepository,
-    protected personRepository: PersonRepository,
-    protected pluginRepository: PluginRepository,
-    protected processRepository: ProcessRepository,
-    protected searchRepository: SearchRepository,
-    protected serverInfoRepository: ServerInfoRepository,
     protected sessionRepository: SessionRepository,
     protected sharedLinkRepository: SharedLinkRepository,
     protected sharedLinkAssetRepository: SharedLinkAssetRepository,
@@ -166,25 +101,12 @@ export class BaseService {
     protected syncCheckpointRepository: SyncCheckpointRepository,
     protected systemMetadataRepository: SystemMetadataRepository,
     protected tagRepository: TagRepository,
-    protected telemetryRepository: TelemetryRepository,
     protected trashRepository: TrashRepository,
     protected userRepository: UserRepository,
-    protected versionRepository: VersionHistoryRepository,
     protected viewRepository: ViewRepository,
-    protected websocketRepository: WebsocketRepository,
-    protected workflowRepository: WorkflowRepository,
   ) {
     this.logger.setContext(this.constructor.name);
-    this.storageCore = StorageCore.create(
-      assetRepository,
-      configRepository,
-      cryptoRepository,
-      moveRepository,
-      personRepository,
-      storageRepository,
-      systemMetadataRepository,
-      this.logger,
-    );
+    this.storageCore = new StorageCore();
   }
 
   get worker() {
@@ -237,8 +159,6 @@ export class BaseService {
     }
 
     const user = await this.userRepository.create(payload);
-
-    await this.eventRepository.emit('UserCreate', user);
 
     return user;
   }

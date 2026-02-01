@@ -1,488 +1,587 @@
-import { Injectable } from '@nestjs/common';
-import { Kysely, sql } from 'kysely';
-import { InjectKysely } from 'nestjs-kysely';
-import { ChunkedSet, DummyValue, GenerateSql } from 'src/decorators';
+/**
+ * Access repository — Workers/D1-compatible version.
+ *
+ * Permission checking layer that determines if a user/shared-link
+ * can access a specific resource.
+ *
+ * Converted from PostgreSQL to D1/SQLite-compatible Kysely queries.
+ * Key changes:
+ * - No ::uuid casts
+ * - No PostgreSQL array syntax (any(), unnest())
+ * - No jsonObjectFrom (PostgreSQL helper)
+ * - Uses `IN (...)` instead of `= any(array[...]::uuid[])`
+ * - Uses `sql.lit()` for enum comparisons where needed
+ */
+
+import type { Kysely } from 'kysely';
+import { sql } from 'kysely';
 import { AlbumUserRole, AssetVisibility } from 'src/enum';
-import { DB } from 'src/schema';
-import { asUuid } from 'src/utils/database';
+import type { DB } from 'src/schema';
+
+// ---------------------------------------------------------------------------
+// Helper: chunk large sets to avoid SQLite parameter limits
+// ---------------------------------------------------------------------------
+
+const CHUNK_SIZE = 500;
+
+async function chunkedCheck<T>(
+  ids: Set<string>,
+  fn: (chunk: Set<string>) => Promise<Set<T>>,
+): Promise<Set<T>> {
+  if (ids.size <= CHUNK_SIZE) {
+    return fn(ids);
+  }
+
+  const result = new Set<T>();
+  const arr = [...ids];
+  for (let i = 0; i < arr.length; i += CHUNK_SIZE) {
+    const chunk = new Set(arr.slice(i, i + CHUNK_SIZE));
+    const partial = await fn(chunk);
+    for (const id of partial) {
+      result.add(id);
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Access sub-classes
+// ---------------------------------------------------------------------------
 
 class ActivityAccess {
   constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkOwnerAccess(userId: string, activityIds: Set<string>) {
-    if (activityIds.size === 0) {
-      return new Set<string>();
-    }
+    if (activityIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('activity')
-      .select('activity.id')
-      .where('activity.id', 'in', [...activityIds])
-      .where('activity.userId', '=', userId)
-      .execute()
-      .then((activities) => new Set(activities.map((activity) => activity.id)));
+    return chunkedCheck(activityIds, async (ids) =>
+      this.db
+        .selectFrom('activity')
+        .select('activity.id')
+        .where('activity.id', 'in', [...ids])
+        .where('activity.userId', '=', userId)
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.id))),
+    );
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkAlbumOwnerAccess(userId: string, activityIds: Set<string>) {
-    if (activityIds.size === 0) {
-      return new Set<string>();
-    }
+    if (activityIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('activity')
-      .select('activity.id')
-      .leftJoin('album', (join) => join.onRef('activity.albumId', '=', 'album.id').on('album.deletedAt', 'is', null))
-      .where('activity.id', 'in', [...activityIds])
-      .whereRef('album.ownerId', '=', asUuid(userId))
-      .execute()
-      .then((activities) => new Set(activities.map((activity) => activity.id)));
+    return chunkedCheck(activityIds, async (ids) =>
+      this.db
+        .selectFrom('activity')
+        .select('activity.id')
+        .leftJoin('album', (join) =>
+          join
+            .onRef('activity.albumId', '=', 'album.id')
+            .on('album.deletedAt', 'is', null),
+        )
+        .where('activity.id', 'in', [...ids])
+        .where('album.ownerId', '=', userId)
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.id))),
+    );
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkCreateAccess(userId: string, albumIds: Set<string>) {
-    if (albumIds.size === 0) {
-      return new Set<string>();
-    }
+    if (albumIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('album')
-      .select('album.id')
-      .leftJoin('album_user as albumUsers', 'albumUsers.albumId', 'album.id')
-      .leftJoin('user', (join) => join.onRef('user.id', '=', 'albumUsers.userId').on('user.deletedAt', 'is', null))
-      .where('album.id', 'in', [...albumIds])
-      .where('album.isActivityEnabled', '=', true)
-      .where((eb) => eb.or([eb('album.ownerId', '=', userId), eb('user.id', '=', userId)]))
-      .where('album.deletedAt', 'is', null)
-      .execute()
-      .then((albums) => new Set(albums.map((album) => album.id)));
+    return chunkedCheck(albumIds, async (ids) =>
+      this.db
+        .selectFrom('album')
+        .select('album.id')
+        .leftJoin('album_user as albumUsers', 'albumUsers.albumId', 'album.id')
+        .leftJoin('user', (join) =>
+          join
+            .onRef('user.id', '=', 'albumUsers.userId')
+            .on('user.deletedAt', 'is', null),
+        )
+        .where('album.id', 'in', [...ids])
+        .where('album.isActivityEnabled', '=', 1)
+        .where((eb) =>
+          eb.or([
+            eb('album.ownerId', '=', userId),
+            eb('user.id', '=', userId),
+          ]),
+        )
+        .where('album.deletedAt', 'is', null)
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.id))),
+    );
   }
 }
 
 class AlbumAccess {
   constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkOwnerAccess(userId: string, albumIds: Set<string>) {
-    if (albumIds.size === 0) {
-      return new Set<string>();
-    }
+    if (albumIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('album')
-      .select('album.id')
-      .where('album.id', 'in', [...albumIds])
-      .where('album.ownerId', '=', userId)
-      .where('album.deletedAt', 'is', null)
-      .execute()
-      .then((albums) => new Set(albums.map((album) => album.id)));
+    return chunkedCheck(albumIds, async (ids) =>
+      this.db
+        .selectFrom('album')
+        .select('album.id')
+        .where('album.id', 'in', [...ids])
+        .where('album.ownerId', '=', userId)
+        .where('album.deletedAt', 'is', null)
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.id))),
+    );
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
-  async checkSharedAlbumAccess(userId: string, albumIds: Set<string>, access: AlbumUserRole) {
-    if (albumIds.size === 0) {
-      return new Set<string>();
-    }
+  async checkSharedAlbumAccess(
+    userId: string,
+    albumIds: Set<string>,
+    access: AlbumUserRole,
+  ) {
+    if (albumIds.size === 0) return new Set<string>();
 
     const accessRole =
-      access === AlbumUserRole.Editor ? [AlbumUserRole.Editor] : [AlbumUserRole.Editor, AlbumUserRole.Viewer];
+      access === AlbumUserRole.Editor
+        ? [AlbumUserRole.Editor]
+        : [AlbumUserRole.Editor, AlbumUserRole.Viewer];
 
-    return this.db
-      .selectFrom('album')
-      .select('album.id')
-      .leftJoin('album_user', 'album_user.albumId', 'album.id')
-      .leftJoin('user', (join) => join.onRef('user.id', '=', 'album_user.userId').on('user.deletedAt', 'is', null))
-      .where('album.id', 'in', [...albumIds])
-      .where('album.deletedAt', 'is', null)
-      .where('user.id', '=', userId)
-      .where('album_user.role', 'in', [...accessRole])
-      .execute()
-      .then((albums) => new Set(albums.map((album) => album.id)));
+    return chunkedCheck(albumIds, async (ids) =>
+      this.db
+        .selectFrom('album')
+        .select('album.id')
+        .leftJoin('album_user', 'album_user.albumId', 'album.id')
+        .leftJoin('user', (join) =>
+          join
+            .onRef('user.id', '=', 'album_user.userId')
+            .on('user.deletedAt', 'is', null),
+        )
+        .where('album.id', 'in', [...ids])
+        .where('album.deletedAt', 'is', null)
+        .where('user.id', '=', userId)
+        .where('album_user.role', 'in', [...accessRole])
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.id))),
+    );
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkSharedLinkAccess(sharedLinkId: string, albumIds: Set<string>) {
-    if (albumIds.size === 0) {
-      return new Set<string>();
-    }
+    if (albumIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('shared_link')
-      .select('shared_link.albumId')
-      .where('shared_link.id', '=', sharedLinkId)
-      .where('shared_link.albumId', 'in', [...albumIds])
-      .execute()
-      .then(
-        (sharedLinks) => new Set(sharedLinks.flatMap((sharedLink) => (sharedLink.albumId ? [sharedLink.albumId] : []))),
-      );
+    return chunkedCheck(albumIds, async (ids) =>
+      this.db
+        .selectFrom('shared_link')
+        .select('shared_link.albumId')
+        .where('shared_link.id', '=', sharedLinkId)
+        .where('shared_link.albumId', 'in', [...ids])
+        .execute()
+        .then(
+          (rows) =>
+            new Set(
+              rows.flatMap((r) => (r.albumId ? [r.albumId] : [])),
+            ),
+        ),
+    );
   }
 }
 
 class AssetAccess {
   constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkAlbumAccess(userId: string, assetIds: Set<string>) {
-    if (assetIds.size === 0) {
-      return new Set<string>();
-    }
+    if (assetIds.size === 0) return new Set<string>();
 
-    return this.db
-      .with('target', (qb) => qb.selectNoFrom(sql`array[${sql.join([...assetIds])}]::uuid[]`.as('ids')))
-      .selectFrom('album')
-      .innerJoin('album_asset as albumAssets', 'album.id', 'albumAssets.albumId')
-      .innerJoin('asset', (join) =>
-        join.onRef('asset.id', '=', 'albumAssets.assetId').on('asset.deletedAt', 'is', null),
-      )
-      .leftJoin('album_user as albumUsers', 'albumUsers.albumId', 'album.id')
-      .leftJoin('user', (join) => join.onRef('user.id', '=', 'albumUsers.userId').on('user.deletedAt', 'is', null))
-      .crossJoin('target')
-      .select(['asset.id', 'asset.livePhotoVideoId'])
-      .where((eb) =>
-        eb.or([
-          eb('asset.id', '=', sql<string>`any(target.ids)`),
-          eb('asset.livePhotoVideoId', '=', sql<string>`any(target.ids)`),
-        ]),
-      )
-      .where((eb) => eb.or([eb('album.ownerId', '=', userId), eb('user.id', '=', userId)]))
-      .where('album.deletedAt', 'is', null)
-      .execute()
-      .then((assets) => {
-        const allowedIds = new Set<string>();
-        for (const asset of assets) {
-          if (asset.id && assetIds.has(asset.id)) {
-            allowedIds.add(asset.id);
-          }
-          if (asset.livePhotoVideoId && assetIds.has(asset.livePhotoVideoId)) {
-            allowedIds.add(asset.livePhotoVideoId);
-          }
+    return chunkedCheck(assetIds, async (ids) => {
+      const idArray = [...ids];
+
+      const rows = await this.db
+        .selectFrom('album')
+        .innerJoin(
+          'album_asset as albumAssets',
+          'album.id',
+          'albumAssets.albumId',
+        )
+        .innerJoin('asset', (join) =>
+          join
+            .onRef('asset.id', '=', 'albumAssets.assetId')
+            .on('asset.deletedAt', 'is', null),
+        )
+        .leftJoin(
+          'album_user as albumUsers',
+          'albumUsers.albumId',
+          'album.id',
+        )
+        .leftJoin('user', (join) =>
+          join
+            .onRef('user.id', '=', 'albumUsers.userId')
+            .on('user.deletedAt', 'is', null),
+        )
+        .select(['asset.id', 'asset.livePhotoVideoId'])
+        .where((eb) =>
+          eb.or([
+            eb('asset.id', 'in', idArray),
+            eb('asset.livePhotoVideoId', 'in', idArray),
+          ]),
+        )
+        .where((eb) =>
+          eb.or([
+            eb('album.ownerId', '=', userId),
+            eb('user.id', '=', userId),
+          ]),
+        )
+        .where('album.deletedAt', 'is', null)
+        .execute();
+
+      const allowedIds = new Set<string>();
+      for (const row of rows) {
+        if (row.id && ids.has(row.id)) {
+          allowedIds.add(row.id);
         }
-        return allowedIds;
-      });
+        if (row.livePhotoVideoId && ids.has(row.livePhotoVideoId)) {
+          allowedIds.add(row.livePhotoVideoId);
+        }
+      }
+      return allowedIds;
+    });
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
-  async checkOwnerAccess(userId: string, assetIds: Set<string>, hasElevatedPermission: boolean | undefined) {
-    if (assetIds.size === 0) {
-      return new Set<string>();
-    }
+  async checkOwnerAccess(
+    userId: string,
+    assetIds: Set<string>,
+    hasElevatedPermission: boolean | undefined,
+  ) {
+    if (assetIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('asset')
-      .select('asset.id')
-      .where('asset.id', 'in', [...assetIds])
-      .where('asset.ownerId', '=', userId)
-      .$if(!hasElevatedPermission, (eb) => eb.where('asset.visibility', '!=', AssetVisibility.Locked))
-      .execute()
-      .then((assets) => new Set(assets.map((asset) => asset.id)));
+    return chunkedCheck(assetIds, async (ids) =>
+      this.db
+        .selectFrom('asset')
+        .select('asset.id')
+        .where('asset.id', 'in', [...ids])
+        .where('asset.ownerId', '=', userId)
+        .$if(!hasElevatedPermission, (eb) =>
+          eb.where('asset.visibility', '!=', AssetVisibility.Locked),
+        )
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.id))),
+    );
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkPartnerAccess(userId: string, assetIds: Set<string>) {
-    if (assetIds.size === 0) {
-      return new Set<string>();
-    }
+    if (assetIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('partner')
-      .innerJoin('user as sharedBy', (join) =>
-        join.onRef('sharedBy.id', '=', 'partner.sharedById').on('sharedBy.deletedAt', 'is', null),
-      )
-      .innerJoin('asset', (join) => join.onRef('asset.ownerId', '=', 'sharedBy.id').on('asset.deletedAt', 'is', null))
-      .select('asset.id')
-      .where('partner.sharedWithId', '=', userId)
-      .where((eb) =>
-        eb.or([
-          eb('asset.visibility', '=', sql.lit(AssetVisibility.Timeline)),
-          eb('asset.visibility', '=', sql.lit(AssetVisibility.Hidden)),
-        ]),
-      )
-
-      .where('asset.id', 'in', [...assetIds])
-      .execute()
-      .then((assets) => new Set(assets.map((asset) => asset.id)));
+    return chunkedCheck(assetIds, async (ids) =>
+      this.db
+        .selectFrom('partner')
+        .innerJoin('user as sharedBy', (join) =>
+          join
+            .onRef('sharedBy.id', '=', 'partner.sharedById')
+            .on('sharedBy.deletedAt', 'is', null),
+        )
+        .innerJoin('asset', (join) =>
+          join
+            .onRef('asset.ownerId', '=', 'sharedBy.id')
+            .on('asset.deletedAt', 'is', null),
+        )
+        .select('asset.id')
+        .where('partner.sharedWithId', '=', userId)
+        .where((eb) =>
+          eb.or([
+            eb('asset.visibility', '=', sql.lit(AssetVisibility.Timeline)),
+            eb('asset.visibility', '=', sql.lit(AssetVisibility.Hidden)),
+          ]),
+        )
+        .where('asset.id', 'in', [...ids])
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.id))),
+    );
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkSharedLinkAccess(sharedLinkId: string, assetIds: Set<string>) {
-    if (assetIds.size === 0) {
-      return new Set<string>();
-    }
+    if (assetIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('shared_link')
-      .leftJoin('album', (join) => join.onRef('album.id', '=', 'shared_link.albumId').on('album.deletedAt', 'is', null))
-      .leftJoin('shared_link_asset', 'shared_link_asset.sharedLinkId', 'shared_link.id')
-      .leftJoin('asset', (join) =>
-        join.onRef('asset.id', '=', 'shared_link_asset.assetId').on('asset.deletedAt', 'is', null),
-      )
-      .leftJoin('album_asset', 'album_asset.albumId', 'album.id')
-      .leftJoin('asset as albumAssets', (join) =>
-        join.onRef('albumAssets.id', '=', 'album_asset.assetId').on('albumAssets.deletedAt', 'is', null),
-      )
-      .select([
-        'asset.id as assetId',
-        'asset.livePhotoVideoId as assetLivePhotoVideoId',
-        'albumAssets.id as albumAssetId',
-        'albumAssets.livePhotoVideoId as albumAssetLivePhotoVideoId',
-      ])
-      .where('shared_link.id', '=', sharedLinkId)
-      .where(
-        sql`array["asset"."id", "asset"."livePhotoVideoId", "albumAssets"."id", "albumAssets"."livePhotoVideoId"]`,
-        '&&',
-        sql`array[${sql.join([...assetIds])}]::uuid[] `,
-      )
-      .execute()
-      .then((rows) => {
-        const allowedIds = new Set<string>();
-        for (const row of rows) {
-          if (row.assetId && assetIds.has(row.assetId)) {
-            allowedIds.add(row.assetId);
-          }
-          if (row.assetLivePhotoVideoId && assetIds.has(row.assetLivePhotoVideoId)) {
-            allowedIds.add(row.assetLivePhotoVideoId);
-          }
-          if (row.albumAssetId && assetIds.has(row.albumAssetId)) {
-            allowedIds.add(row.albumAssetId);
-          }
-          if (row.albumAssetLivePhotoVideoId && assetIds.has(row.albumAssetLivePhotoVideoId)) {
-            allowedIds.add(row.albumAssetLivePhotoVideoId);
-          }
+    return chunkedCheck(assetIds, async (ids) => {
+      const idArray = [...ids];
+
+      const rows = await this.db
+        .selectFrom('shared_link')
+        .leftJoin('album', (join) =>
+          join
+            .onRef('album.id', '=', 'shared_link.albumId')
+            .on('album.deletedAt', 'is', null),
+        )
+        .leftJoin(
+          'shared_link_asset',
+          'shared_link_asset.sharedLinkId',
+          'shared_link.id',
+        )
+        .leftJoin('asset', (join) =>
+          join
+            .onRef('asset.id', '=', 'shared_link_asset.assetId')
+            .on('asset.deletedAt', 'is', null),
+        )
+        .leftJoin('album_asset', 'album_asset.albumId', 'album.id')
+        .leftJoin('asset as albumAssets', (join) =>
+          join
+            .onRef('albumAssets.id', '=', 'album_asset.assetId')
+            .on('albumAssets.deletedAt', 'is', null),
+        )
+        .select([
+          'asset.id as assetId',
+          'asset.livePhotoVideoId as assetLivePhotoVideoId',
+          'albumAssets.id as albumAssetId',
+          'albumAssets.livePhotoVideoId as albumAssetLivePhotoVideoId',
+        ])
+        .where('shared_link.id', '=', sharedLinkId)
+        .where((eb) =>
+          eb.or([
+            eb('asset.id', 'in', idArray),
+            eb('asset.livePhotoVideoId', 'in', idArray),
+            eb('albumAssets.id', 'in', idArray),
+            eb('albumAssets.livePhotoVideoId', 'in', idArray),
+          ]),
+        )
+        .execute();
+
+      const allowedIds = new Set<string>();
+      for (const row of rows) {
+        if (row.assetId && ids.has(row.assetId)) {
+          allowedIds.add(row.assetId);
         }
-        return allowedIds;
-      });
+        if (
+          row.assetLivePhotoVideoId &&
+          ids.has(row.assetLivePhotoVideoId)
+        ) {
+          allowedIds.add(row.assetLivePhotoVideoId);
+        }
+        if (row.albumAssetId && ids.has(row.albumAssetId)) {
+          allowedIds.add(row.albumAssetId);
+        }
+        if (
+          row.albumAssetLivePhotoVideoId &&
+          ids.has(row.albumAssetLivePhotoVideoId)
+        ) {
+          allowedIds.add(row.albumAssetLivePhotoVideoId);
+        }
+      }
+      return allowedIds;
+    });
   }
 }
 
 class AuthDeviceAccess {
   constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkOwnerAccess(userId: string, deviceIds: Set<string>) {
-    if (deviceIds.size === 0) {
-      return new Set<string>();
-    }
+    if (deviceIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('session')
-      .select('session.id')
-      .where('session.userId', '=', userId)
-      .where('session.id', 'in', [...deviceIds])
-      .execute()
-      .then((tokens) => new Set(tokens.map((token) => token.id)));
+    return chunkedCheck(deviceIds, async (ids) =>
+      this.db
+        .selectFrom('session')
+        .select('session.id')
+        .where('session.userId', '=', userId)
+        .where('session.id', 'in', [...ids])
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.id))),
+    );
   }
 }
 
 class NotificationAccess {
   constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkOwnerAccess(userId: string, notificationIds: Set<string>) {
-    if (notificationIds.size === 0) {
-      return new Set<string>();
-    }
+    if (notificationIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('notification')
-      .select('notification.id')
-      .where('notification.id', 'in', [...notificationIds])
-      .where('notification.userId', '=', userId)
-      .execute()
-      .then((stacks) => new Set(stacks.map((stack) => stack.id)));
+    return chunkedCheck(notificationIds, async (ids) =>
+      this.db
+        .selectFrom('notification' as any)
+        .select('notification.id' as any)
+        .where('notification.id' as any, 'in', [...ids])
+        .where('notification.userId' as any, '=', userId)
+        .execute()
+        .then((rows: any[]) => new Set(rows.map((r: any) => r.id as string))),
+    );
   }
 }
 
 class SessionAccess {
   constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkOwnerAccess(userId: string, sessionIds: Set<string>) {
-    if (sessionIds.size === 0) {
-      return new Set<string>();
-    }
+    if (sessionIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('session')
-      .select('session.id')
-      .where('session.id', 'in', [...sessionIds])
-      .where('session.userId', '=', userId)
-      .execute()
-      .then((sessions) => new Set(sessions.map((session) => session.id)));
+    return chunkedCheck(sessionIds, async (ids) =>
+      this.db
+        .selectFrom('session')
+        .select('session.id')
+        .where('session.id', 'in', [...ids])
+        .where('session.userId', '=', userId)
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.id))),
+    );
   }
 }
+
 class StackAccess {
   constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkOwnerAccess(userId: string, stackIds: Set<string>) {
-    if (stackIds.size === 0) {
-      return new Set<string>();
-    }
+    if (stackIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('stack')
-      .select('stack.id')
-      .where('stack.id', 'in', [...stackIds])
-      .where('stack.ownerId', '=', userId)
-      .execute()
-      .then((stacks) => new Set(stacks.map((stack) => stack.id)));
+    return chunkedCheck(stackIds, async (ids) =>
+      this.db
+        .selectFrom('stack')
+        .select('stack.id')
+        .where('stack.id', 'in', [...ids])
+        .where('stack.ownerId', '=', userId)
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.id))),
+    );
   }
 }
 
 class TimelineAccess {
   constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkPartnerAccess(userId: string, partnerIds: Set<string>) {
-    if (partnerIds.size === 0) {
-      return new Set<string>();
-    }
+    if (partnerIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('partner')
-      .select('partner.sharedById')
-      .where('partner.sharedById', 'in', [...partnerIds])
-      .where('partner.sharedWithId', '=', userId)
-      .execute()
-      .then((partners) => new Set(partners.map((partner) => partner.sharedById)));
+    return chunkedCheck(partnerIds, async (ids) =>
+      this.db
+        .selectFrom('partner')
+        .select('partner.sharedById')
+        .where('partner.sharedById', 'in', [...ids])
+        .where('partner.sharedWithId', '=', userId)
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.sharedById))),
+    );
   }
 }
 
 class MemoryAccess {
   constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkOwnerAccess(userId: string, memoryIds: Set<string>) {
-    if (memoryIds.size === 0) {
-      return new Set<string>();
-    }
+    if (memoryIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('memory')
-      .select('memory.id')
-      .where('memory.id', 'in', [...memoryIds])
-      .where('memory.ownerId', '=', userId)
-      .where('memory.deletedAt', 'is', null)
-      .execute()
-      .then((memories) => new Set(memories.map((memory) => memory.id)));
+    return chunkedCheck(memoryIds, async (ids) =>
+      this.db
+        .selectFrom('memory')
+        .select('memory.id')
+        .where('memory.id', 'in', [...ids])
+        .where('memory.ownerId', '=', userId)
+        .where('memory.deletedAt', 'is', null)
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.id))),
+    );
   }
 }
 
 class PersonAccess {
   constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkOwnerAccess(userId: string, personIds: Set<string>) {
-    if (personIds.size === 0) {
-      return new Set<string>();
-    }
+    if (personIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('person')
-      .select('person.id')
-      .where('person.id', 'in', [...personIds])
-      .where('person.ownerId', '=', userId)
-      .execute()
-      .then((persons) => new Set(persons.map((person) => person.id)));
+    // person table may not exist in D1 yet, use raw query with error handling
+    return chunkedCheck(personIds, async (ids) => {
+      try {
+        const rows = await this.db
+          .selectFrom('person' as any)
+          .select('person.id' as any)
+          .where('person.id' as any, 'in', [...ids])
+          .where('person.ownerId' as any, '=', userId)
+          .execute();
+        return new Set((rows as any[]).map((r: any) => r.id as string));
+      } catch {
+        return new Set<string>();
+      }
+    });
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkFaceOwnerAccess(userId: string, assetFaceIds: Set<string>) {
-    if (assetFaceIds.size === 0) {
-      return new Set<string>();
-    }
+    if (assetFaceIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('asset_face')
-      .select('asset_face.id')
-      .leftJoin('asset', (join) => join.onRef('asset.id', '=', 'asset_face.assetId').on('asset.deletedAt', 'is', null))
-      .where('asset_face.id', 'in', [...assetFaceIds])
-      .where('asset.ownerId', '=', userId)
-      .execute()
-      .then((faces) => new Set(faces.map((face) => face.id)));
+    return chunkedCheck(assetFaceIds, async (ids) => {
+      try {
+        const rows = await this.db
+          .selectFrom('asset_face' as any)
+          .select('asset_face.id' as any)
+          .leftJoin('asset', (join: any) =>
+            join
+              .onRef('asset.id', '=', 'asset_face.assetId')
+              .on('asset.deletedAt', 'is', null),
+          )
+          .where('asset_face.id' as any, 'in', [...ids])
+          .where('asset.ownerId', '=', userId)
+          .execute();
+        return new Set((rows as any[]).map((r: any) => r.id as string));
+      } catch {
+        return new Set<string>();
+      }
+    });
   }
 }
 
 class PartnerAccess {
   constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkUpdateAccess(userId: string, partnerIds: Set<string>) {
-    if (partnerIds.size === 0) {
-      return new Set<string>();
-    }
+    if (partnerIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('partner')
-      .select('partner.sharedById')
-      .where('partner.sharedById', 'in', [...partnerIds])
-      .where('partner.sharedWithId', '=', userId)
-      .execute()
-      .then((partners) => new Set(partners.map((partner) => partner.sharedById)));
+    return chunkedCheck(partnerIds, async (ids) =>
+      this.db
+        .selectFrom('partner')
+        .select('partner.sharedById')
+        .where('partner.sharedById', 'in', [...ids])
+        .where('partner.sharedWithId', '=', userId)
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.sharedById))),
+    );
   }
 }
 
 class TagAccess {
   constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkOwnerAccess(userId: string, tagIds: Set<string>) {
-    if (tagIds.size === 0) {
-      return new Set<string>();
-    }
+    if (tagIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('tag')
-      .select('tag.id')
-      .where('tag.id', 'in', [...tagIds])
-      .where('tag.userId', '=', userId)
-      .execute()
-      .then((tags) => new Set(tags.map((tag) => tag.id)));
+    return chunkedCheck(tagIds, async (ids) =>
+      this.db
+        .selectFrom('tag')
+        .select('tag.id')
+        .where('tag.id', 'in', [...ids])
+        .where('tag.userId', '=', userId)
+        .execute()
+        .then((rows) => new Set(rows.map((r) => r.id))),
+    );
   }
 }
 
 class WorkflowAccess {
   constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID_SET] })
-  @ChunkedSet({ paramIndex: 1 })
   async checkOwnerAccess(userId: string, workflowIds: Set<string>) {
-    if (workflowIds.size === 0) {
-      return new Set<string>();
-    }
+    if (workflowIds.size === 0) return new Set<string>();
 
-    return this.db
-      .selectFrom('workflow')
-      .select('workflow.id')
-      .where('workflow.id', 'in', [...workflowIds])
-      .where('workflow.ownerId', '=', userId)
-      .execute()
-      .then((workflows) => new Set(workflows.map((workflow) => workflow.id)));
+    // workflow table may not exist in D1 schema yet
+    return chunkedCheck(workflowIds, async (ids) => {
+      try {
+        const rows = await this.db
+          .selectFrom('workflow' as any)
+          .select('workflow.id' as any)
+          .where('workflow.id' as any, 'in', [...ids])
+          .where('workflow.ownerId' as any, '=', userId)
+          .execute();
+        return new Set((rows as any[]).map((r: any) => r.id as string));
+      } catch {
+        return new Set<string>();
+      }
+    });
   }
 }
 
-@Injectable()
+// ---------------------------------------------------------------------------
+// Main AccessRepository
+// ---------------------------------------------------------------------------
+
 export class AccessRepository {
   activity: ActivityAccess;
   album: AlbumAccess;
@@ -498,7 +597,7 @@ export class AccessRepository {
   timeline: TimelineAccess;
   workflow: WorkflowAccess;
 
-  constructor(@InjectKysely() db: Kysely<DB>) {
+  constructor(db: Kysely<DB>) {
     this.activity = new ActivityAccess(db);
     this.album = new AlbumAccess(db);
     this.asset = new AssetAccess(db);

@@ -1,8 +1,15 @@
-import { ValidateBoolean } from 'src/validation';
+import { z } from 'zod';
+import { coerceBoolean } from 'src/validation';
 
-export class OnboardingDto {
-  @ValidateBoolean({ description: 'Is user onboarded' })
-  isOnboarded!: boolean;
+// --- Request Schemas ---
+
+export const OnboardingSchema = z.object({
+  isOnboarded: coerceBoolean,
+});
+export type OnboardingDto = z.infer<typeof OnboardingSchema>;
+
+// --- Response DTO ---
+
+export interface OnboardingResponseDto {
+  isOnboarded: boolean;
 }
-
-export class OnboardingResponseDto extends OnboardingDto {}

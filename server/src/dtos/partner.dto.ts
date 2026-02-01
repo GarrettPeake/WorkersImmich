@@ -1,26 +1,26 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsNotEmpty } from 'class-validator';
+import { z } from 'zod';
 import { UserResponseDto } from 'src/dtos/user.dto';
 import { PartnerDirection } from 'src/repositories/partner.repository';
-import { ValidateEnum, ValidateUUID } from 'src/validation';
 
-export class PartnerCreateDto {
-  @ValidateUUID({ description: 'User ID to share with' })
-  sharedWithId!: string;
-}
+// --- Request Schemas ---
 
-export class PartnerUpdateDto {
-  @ApiProperty({ description: 'Show partner assets in timeline' })
-  @IsNotEmpty()
-  inTimeline!: boolean;
-}
+export const PartnerCreateSchema = z.object({
+  sharedWithId: z.string().uuid(),
+});
+export type PartnerCreateDto = z.infer<typeof PartnerCreateSchema>;
 
-export class PartnerSearchDto {
-  @ValidateEnum({ enum: PartnerDirection, name: 'PartnerDirection', description: 'Partner direction' })
-  direction!: PartnerDirection;
-}
+export const PartnerUpdateSchema = z.object({
+  inTimeline: z.boolean(),
+});
+export type PartnerUpdateDto = z.infer<typeof PartnerUpdateSchema>;
 
-export class PartnerResponseDto extends UserResponseDto {
-  @ApiPropertyOptional({ description: 'Show in timeline' })
+export const PartnerSearchSchema = z.object({
+  direction: z.nativeEnum(PartnerDirection),
+});
+export type PartnerSearchDto = z.infer<typeof PartnerSearchSchema>;
+
+// --- Response DTOs (plain interfaces) ---
+
+export interface PartnerResponseDto extends UserResponseDto {
   inTimeline?: boolean;
 }

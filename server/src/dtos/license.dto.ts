@@ -1,20 +1,17 @@
-import { ApiProperty } from '@nestjs/swagger';
-import { IsNotEmpty, IsString, Matches } from 'class-validator';
+import { z } from 'zod';
 
-export class LicenseKeyDto {
-  @ApiProperty({ description: 'License key (format: IM(SV|CL)(-XXXX){8})' })
-  @IsString()
-  @IsNotEmpty()
-  @Matches(/IM(SV|CL)(-[\dA-Za-z]{4}){8}/)
-  licenseKey!: string;
+// --- Request Schemas ---
 
-  @ApiProperty({ description: 'Activation key' })
-  @IsString()
-  @IsNotEmpty()
-  activationKey!: string;
-}
+export const LicenseKeySchema = z.object({
+  licenseKey: z.string().min(1).regex(/IM(SV|CL)(-[\dA-Za-z]{4}){8}/),
+  activationKey: z.string().min(1),
+});
+export type LicenseKeyDto = z.infer<typeof LicenseKeySchema>;
 
-export class LicenseResponseDto extends LicenseKeyDto {
-  @ApiProperty({ description: 'Activation date' })
-  activatedAt!: Date;
+// --- Response DTOs (plain interfaces) ---
+
+export interface LicenseResponseDto {
+  licenseKey: string;
+  activationKey: string;
+  activatedAt: Date;
 }

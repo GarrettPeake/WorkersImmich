@@ -1,14 +1,19 @@
-import { Injectable } from '@nestjs/common';
-import { Insertable, Kysely, NotNull, sql, Updateable } from 'kysely';
-import { jsonObjectFrom } from 'kysely/helpers/postgres';
-import _ from 'lodash';
-import { InjectKysely } from 'nestjs-kysely';
-import { Album, columns } from 'src/database';
-import { DummyValue, GenerateSql } from 'src/decorators';
-import { MapAsset } from 'src/dtos/asset-response.dto';
+/**
+ * Shared Link repository -- Workers/D1-compatible version.
+ *
+ * Converted from PostgreSQL to D1/SQLite-compatible Kysely queries.
+ * Key changes:
+ * - No jsonObjectFrom/jsonArrayFrom from kysely/helpers/postgres
+ * - No LATERAL JOIN -- use separate queries
+ * - No DISTINCT ON -- use ORDER BY + GROUP BY or separate logic
+ * - No @Injectable, @InjectKysely, @GenerateSql decorators
+ * - No lodash dependency
+ * - Separate queries to build complex objects
+ */
+
+import type { Insertable, Kysely, Updateable } from 'kysely';
+import type { DB, SharedLinkTable } from 'src/schema';
 import { SharedLinkType } from 'src/enum';
-import { DB } from 'src/schema';
-import { SharedLinkTable } from 'src/schema/tables/shared-link.table';
 
 export type SharedLinkSearchOptions = {
   userId: string;
@@ -16,263 +21,221 @@ export type SharedLinkSearchOptions = {
   albumId?: string;
 };
 
-@Injectable()
 export class SharedLinkRepository {
-  constructor(@InjectKysely() private db: Kysely<DB>) {}
+  constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID] })
-  get(userId: string, id: string) {
-    return this.db
+  async get(userId: string, id: string) {
+    const link = await this.db
       .selectFrom('shared_link')
       .selectAll('shared_link')
-      .leftJoinLateral(
-        (eb) =>
-          eb
-            .selectFrom('shared_link_asset')
-            .whereRef('shared_link.id', '=', 'shared_link_asset.sharedLinkId')
-            .innerJoin('asset', 'asset.id', 'shared_link_asset.assetId')
-            .where('asset.deletedAt', 'is', null)
-            .selectAll('asset')
-            .innerJoinLateral(
-              (eb) =>
-                eb
-                  .selectFrom('asset_exif')
-                  .selectAll('asset_exif')
-                  .whereRef('asset_exif.assetId', '=', 'asset.id')
-                  .as('exifInfo'),
-              (join) => join.onTrue(),
-            )
-            .select((eb) => eb.fn.toJson('exifInfo').as('exifInfo'))
-            .orderBy('asset.fileCreatedAt', 'asc')
-            .as('a'),
-        (join) => join.onTrue(),
-      )
-      .leftJoinLateral(
-        (eb) =>
-          eb
-            .selectFrom('album')
-            .selectAll('album')
-            .whereRef('album.id', '=', 'shared_link.albumId')
-            .where('album.deletedAt', 'is', null)
-            .leftJoin('album_asset', 'album_asset.albumId', 'album.id')
-            .leftJoinLateral(
-              (eb) =>
-                eb
-                  .selectFrom('asset')
-                  .selectAll('asset')
-                  .whereRef('album_asset.assetId', '=', 'asset.id')
-                  .where('asset.deletedAt', 'is', null)
-                  .innerJoinLateral(
-                    (eb) =>
-                      eb
-                        .selectFrom('asset_exif')
-                        .selectAll('asset_exif')
-                        .whereRef('asset_exif.assetId', '=', 'asset.id')
-                        .as('exifInfo'),
-                    (join) => join.onTrue(),
-                  )
-                  .select((eb) => eb.fn.toJson(eb.table('exifInfo')).as('exifInfo'))
-                  .orderBy('asset.fileCreatedAt', 'asc')
-                  .as('assets'),
-              (join) => join.onTrue(),
-            )
-            .innerJoinLateral(
-              (eb) =>
-                eb
-                  .selectFrom('user')
-                  .selectAll('user')
-                  .whereRef('user.id', '=', 'album.ownerId')
-                  .where('user.deletedAt', 'is', null)
-                  .as('owner'),
-              (join) => join.onTrue(),
-            )
-            .select((eb) =>
-              eb.fn
-                .coalesce(
-                  eb.fn
-                    .jsonAgg('assets')
-                    .orderBy('assets.fileCreatedAt', 'asc')
-                    .filterWhere('assets.id', 'is not', null),
-
-                  sql`'[]'`,
-                )
-                .as('assets'),
-            )
-            .select((eb) => eb.fn.toJson('owner').as('owner'))
-            .groupBy(['album.id', sql`"owner".*`])
-            .as('album'),
-        (join) => join.onTrue(),
-      )
-      .select((eb) =>
-        eb.fn
-          .coalesce(eb.fn.jsonAgg('a').filterWhere('a.id', 'is not', null), sql`'[]'`)
-          .$castTo<MapAsset[]>()
-          .as('assets'),
-      )
-      .groupBy(['shared_link.id', sql`"album".*`])
-      .select((eb) => eb.fn.toJson('album').$castTo<Album | null>().as('album'))
       .where('shared_link.id', '=', id)
       .where('shared_link.userId', '=', userId)
-      .where((eb) => eb.or([eb('shared_link.type', '=', SharedLinkType.Individual), eb('album.id', 'is not', null)]))
-      .orderBy('shared_link.createdAt', 'desc')
       .executeTakeFirst();
+
+    if (!link) return undefined;
+
+    // Get assets for individual links
+    const assets = await this.db
+      .selectFrom('shared_link_asset')
+      .innerJoin('asset', 'asset.id', 'shared_link_asset.assetId')
+      .selectAll('asset')
+      .where('shared_link_asset.sharedLinkId', '=', id)
+      .where('asset.deletedAt', 'is', null)
+      .orderBy('asset.fileCreatedAt', 'asc')
+      .execute();
+
+    // Get album if it's an album link
+    let album: any = null;
+    if (link.albumId) {
+      album = await this.db
+        .selectFrom('album')
+        .selectAll('album')
+        .where('album.id', '=', link.albumId)
+        .where('album.deletedAt', 'is', null)
+        .executeTakeFirst();
+
+      if (album) {
+        // Get album owner
+        const owner = await this.db
+          .selectFrom('user')
+          .selectAll()
+          .where('user.id', '=', album.ownerId)
+          .where('user.deletedAt', 'is', null)
+          .executeTakeFirst();
+
+        // Get album assets
+        const albumAssets = await this.db
+          .selectFrom('asset')
+          .selectAll('asset')
+          .innerJoin('album_asset', 'album_asset.assetId', 'asset.id')
+          .where('album_asset.albumId', '=', link.albumId!)
+          .where('asset.deletedAt', 'is', null)
+          .orderBy('asset.fileCreatedAt', 'asc')
+          .execute();
+
+        album = { ...album, owner, assets: albumAssets };
+      }
+    }
+
+    // Filter: for album links, album must exist
+    if (link.type !== SharedLinkType.Individual && !album) {
+      return undefined;
+    }
+
+    return { ...link, assets, album };
   }
 
-  @GenerateSql({ params: [{ userId: DummyValue.UUID, albumId: DummyValue.UUID }] })
-  getAll({ userId, id, albumId }: SharedLinkSearchOptions) {
-    return this.db
+  async getAll({ userId, id, albumId }: SharedLinkSearchOptions) {
+    let query = this.db
       .selectFrom('shared_link')
       .selectAll('shared_link')
-      .where('shared_link.userId', '=', userId)
-      .leftJoin('shared_link_asset', 'shared_link_asset.sharedLinkId', 'shared_link.id')
-      .leftJoinLateral(
-        (eb) =>
-          eb
-            .selectFrom('asset')
-            .select((eb) => eb.fn.jsonAgg('asset').as('assets'))
-            .whereRef('asset.id', '=', 'shared_link_asset.assetId')
-            .where('asset.deletedAt', 'is', null)
-            .as('assets'),
-        (join) => join.onTrue(),
-      )
-      .select('assets.assets')
-      .$narrowType<{ assets: NotNull }>()
-      .leftJoinLateral(
-        (eb) =>
-          eb
+      .where('shared_link.userId', '=', userId);
+
+    if (id) {
+      query = query.where('shared_link.id', '=', id);
+    }
+    if (albumId) {
+      query = query.where('shared_link.albumId', '=', albumId);
+    }
+
+    const links = await query
+      .orderBy('shared_link.createdAt', 'desc')
+      .execute();
+
+    // Enrich each link
+    const results = await Promise.all(
+      links.map(async (link) => {
+        // Get individual assets
+        const assets = await this.db
+          .selectFrom('shared_link_asset')
+          .innerJoin('asset', 'asset.id', 'shared_link_asset.assetId')
+          .selectAll('asset')
+          .where('shared_link_asset.sharedLinkId', '=', link.id)
+          .where('asset.deletedAt', 'is', null)
+          .execute();
+
+        // Get album
+        let album: any = null;
+        if (link.albumId) {
+          album = await this.db
             .selectFrom('album')
             .selectAll('album')
-            .whereRef('album.id', '=', 'shared_link.albumId')
-            .innerJoinLateral(
-              (eb) =>
-                eb
-                  .selectFrom('user')
-                  .select([
-                    'user.id',
-                    'user.email',
-                    'user.createdAt',
-                    'user.profileImagePath',
-                    'user.isAdmin',
-                    'user.shouldChangePassword',
-                    'user.deletedAt',
-                    'user.oauthId',
-                    'user.updatedAt',
-                    'user.storageLabel',
-                    'user.name',
-                    'user.quotaSizeInBytes',
-                    'user.quotaUsageInBytes',
-                    'user.status',
-                    'user.profileChangedAt',
-                  ])
-                  .whereRef('user.id', '=', 'album.ownerId')
-                  .where('user.deletedAt', 'is', null)
-                  .as('owner'),
-              (join) => join.onTrue(),
-            )
-            .select((eb) => eb.fn.toJson('owner').as('owner'))
+            .where('album.id', '=', link.albumId)
             .where('album.deletedAt', 'is', null)
-            .as('album'),
-        (join) => join.onTrue(),
-      )
-      .select((eb) => eb.fn.toJson('album').$castTo<Album | null>().as('album'))
-      .where((eb) => eb.or([eb('shared_link.type', '=', SharedLinkType.Individual), eb('album.id', 'is not', null)]))
-      .$if(!!albumId, (eb) => eb.where('shared_link.albumId', '=', albumId!))
-      .$if(!!id, (eb) => eb.where('shared_link.id', '=', id!))
-      .orderBy('shared_link.createdAt', 'desc')
-      .distinctOn(['shared_link.createdAt'])
-      .execute();
+            .executeTakeFirst();
+
+          if (album) {
+            const owner = await this.db
+              .selectFrom('user')
+              .selectAll()
+              .where('user.id', '=', album.ownerId)
+              .where('user.deletedAt', 'is', null)
+              .executeTakeFirst();
+            album = { ...album, owner };
+          }
+        }
+
+        // Filter: for album links, album must exist
+        if (link.type !== SharedLinkType.Individual && !album) {
+          return null;
+        }
+
+        return { ...link, assets, album };
+      }),
+    );
+
+    return results.filter(Boolean);
   }
 
-  @GenerateSql({ params: [DummyValue.BUFFER] })
-  getByKey(key: Buffer) {
+  async getByKey(key: Uint8Array) {
     return this.authBuilder().where('shared_link.key', '=', key).executeTakeFirst();
   }
 
-  @GenerateSql({ params: [DummyValue.BUFFER] })
-  getBySlug(slug: string) {
+  async getBySlug(slug: string) {
     return this.authBuilder().where('shared_link.slug', '=', slug).executeTakeFirst();
   }
 
-  private authBuilder() {
-    return this.db
-      .selectFrom('shared_link')
-      .leftJoin('album', 'album.id', 'shared_link.albumId')
-      .where('album.deletedAt', 'is', null)
-      .select((eb) => [
-        ...columns.authSharedLink,
-        jsonObjectFrom(
-          eb.selectFrom('user').select(columns.authUser).whereRef('user.id', '=', 'shared_link.userId'),
-        ).as('user'),
-      ])
-      .where((eb) => eb.or([eb('shared_link.type', '=', SharedLinkType.Individual), eb('album.id', 'is not', null)]));
-  }
-
   async create(entity: Insertable<SharedLinkTable> & { assetIds?: string[] }) {
-    const { id } = await this.db
-      .insertInto('shared_link')
-      .values(_.omit(entity, 'assetIds'))
-      .returningAll()
+    const { assetIds, ...linkData } = entity as any;
+
+    await this.db.insertInto('shared_link').values(linkData).execute();
+
+    // Get the created link (order by createdAt desc to get the latest)
+    const created = await this.db
+      .selectFrom('shared_link')
+      .selectAll()
+      .where('shared_link.userId', '=', linkData.userId)
+      .where('shared_link.key', '=', linkData.key)
       .executeTakeFirstOrThrow();
 
-    if (entity.assetIds && entity.assetIds.length > 0) {
+    if (assetIds && assetIds.length > 0) {
       await this.db
         .insertInto('shared_link_asset')
-        .values(entity.assetIds!.map((assetId) => ({ assetId, sharedLinkId: id })))
+        .values(assetIds.map((assetId: string) => ({ assetId, sharedLinkId: created.id })))
         .execute();
     }
 
-    return this.getSharedLinks(id);
+    return this.getSharedLinkById(created.id);
   }
 
   async update(entity: Updateable<SharedLinkTable> & { id: string; assetIds?: string[] }) {
-    const { id } = await this.db
-      .updateTable('shared_link')
-      .set(_.omit(entity, 'assets', 'album', 'assetIds'))
-      .where('shared_link.id', '=', entity.id)
-      .returningAll()
-      .executeTakeFirstOrThrow();
+    const { assetIds, assets, album, ...linkData } = entity as any;
 
-    if (entity.assetIds && entity.assetIds.length > 0) {
+    await this.db
+      .updateTable('shared_link')
+      .set(linkData)
+      .where('shared_link.id', '=', entity.id!)
+      .execute();
+
+    if (assetIds && assetIds.length > 0) {
       await this.db
         .insertInto('shared_link_asset')
-        .values(entity.assetIds!.map((assetId) => ({ assetId, sharedLinkId: id })))
+        .values(assetIds.map((assetId: string) => ({ assetId, sharedLinkId: entity.id })))
         .execute();
     }
 
-    return this.getSharedLinks(id);
+    return this.getSharedLinkById(entity.id!);
   }
 
   async remove(id: string): Promise<void> {
     await this.db.deleteFrom('shared_link').where('shared_link.id', '=', id).execute();
   }
 
-  private getSharedLinks(id: string) {
+  // -------------------------------------------------------------------------
+  // Private helpers
+  // -------------------------------------------------------------------------
+
+  private authBuilder() {
     return this.db
+      .selectFrom('shared_link')
+      .leftJoin('album', 'album.id', 'shared_link.albumId')
+      .selectAll('shared_link')
+      .where((eb) =>
+        eb.or([
+          eb('shared_link.type', '=', SharedLinkType.Individual),
+          eb.and([
+            eb('album.id', 'is not', null),
+            eb('album.deletedAt', 'is', null),
+          ]),
+        ]),
+      );
+  }
+
+  private async getSharedLinkById(id: string) {
+    const link = await this.db
       .selectFrom('shared_link')
       .selectAll('shared_link')
       .where('shared_link.id', '=', id)
-      .leftJoin('shared_link_asset', 'shared_link_asset.sharedLinkId', 'shared_link.id')
-      .leftJoinLateral(
-        (eb) =>
-          eb
-            .selectFrom('asset')
-            .whereRef('asset.id', '=', 'shared_link_asset.assetId')
-            .selectAll('asset')
-            .innerJoinLateral(
-              (eb) =>
-                eb.selectFrom('asset_exif').whereRef('asset_exif.assetId', '=', 'asset.id').selectAll().as('exif'),
-              (join) => join.onTrue(),
-            )
-            .as('assets'),
-        (join) => join.onTrue(),
-      )
-      .select((eb) =>
-        eb.fn
-          .coalesce(eb.fn.jsonAgg('assets').filterWhere('assets.id', 'is not', null), sql`'[]'`)
-          .$castTo<MapAsset[]>()
-          .as('assets'),
-      )
-      .groupBy('shared_link.id')
       .executeTakeFirstOrThrow();
+
+    const assets = await this.db
+      .selectFrom('shared_link_asset')
+      .innerJoin('asset', 'asset.id', 'shared_link_asset.assetId')
+      .selectAll('asset')
+      .where('shared_link_asset.sharedLinkId', '=', id)
+      .where('asset.deletedAt', 'is', null)
+      .execute();
+
+    return { ...link, assets };
   }
 }

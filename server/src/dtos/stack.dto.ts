@@ -1,34 +1,34 @@
-import { ApiProperty } from '@nestjs/swagger';
-import { ArrayMinSize } from 'class-validator';
+import { z } from 'zod';
 import { Stack } from 'src/database';
 import { AssetResponseDto, mapAsset } from 'src/dtos/asset-response.dto';
 import { AuthDto } from 'src/dtos/auth.dto';
-import { ValidateUUID } from 'src/validation';
 
-export class StackCreateDto {
-  @ValidateUUID({ each: true, description: 'Asset IDs (first becomes primary, min 2)' })
-  @ArrayMinSize(2)
-  assetIds!: string[];
+// --- Request Schemas ---
+
+export const StackCreateSchema = z.object({
+  assetIds: z.array(z.string().uuid()).min(2),
+});
+export type StackCreateDto = z.infer<typeof StackCreateSchema>;
+
+export const StackSearchSchema = z.object({
+  primaryAssetId: z.string().uuid().optional(),
+});
+export type StackSearchDto = z.infer<typeof StackSearchSchema>;
+
+export const StackUpdateSchema = z.object({
+  primaryAssetId: z.string().uuid().optional(),
+});
+export type StackUpdateDto = z.infer<typeof StackUpdateSchema>;
+
+// --- Response DTOs (plain interfaces) ---
+
+export interface StackResponseDto {
+  id: string;
+  primaryAssetId: string;
+  assets: AssetResponseDto[];
 }
 
-export class StackSearchDto {
-  @ValidateUUID({ optional: true, description: 'Filter by primary asset ID' })
-  primaryAssetId?: string;
-}
-
-export class StackUpdateDto {
-  @ValidateUUID({ optional: true, description: 'Primary asset ID' })
-  primaryAssetId?: string;
-}
-
-export class StackResponseDto {
-  @ApiProperty({ description: 'Stack ID' })
-  id!: string;
-  @ApiProperty({ description: 'Primary asset ID' })
-  primaryAssetId!: string;
-  @ApiProperty({ description: 'Stack assets' })
-  assets!: AssetResponseDto[];
-}
+// --- Mapper ---
 
 export const mapStack = (stack: Stack, { auth }: { auth?: AuthDto }) => {
   const primary = stack.assets.filter((asset) => asset.id === stack.primaryAssetId);

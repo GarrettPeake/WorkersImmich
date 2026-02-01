@@ -38,9 +38,7 @@ export enum AssetType {
 }
 
 export enum AssetFileType {
-  /**
-   * An full/large-size image extracted/converted from RAW photos
-   */
+  /** An full/large-size image extracted/converted from RAW photos */
   FullSize = 'fullsize',
   Preview = 'preview',
   Thumbnail = 'thumbnail',
@@ -74,7 +72,6 @@ export enum MemoryType {
 }
 
 export enum AssetOrderWithRandom {
-  // Include existing values
   Asc = AssetOrder.Asc,
   Desc = AssetOrder.Desc,
   /** Randomly Ordered */
@@ -95,7 +92,6 @@ export enum Permission {
   ApiKeyUpdate = 'apiKey.update',
   ApiKeyDelete = 'apiKey.delete',
 
-  // ASSET_CREATE = 'asset.create',
   AssetRead = 'asset.read',
   AssetUpdate = 'asset.update',
   AssetDelete = 'asset.delete',
@@ -133,37 +129,10 @@ export enum Permission {
 
   ArchiveRead = 'archive.read',
 
-  BackupList = 'backup.list',
-  BackupDownload = 'backup.download',
-  BackupUpload = 'backup.upload',
-  BackupDelete = 'backup.delete',
-
-  DuplicateRead = 'duplicate.read',
-  DuplicateDelete = 'duplicate.delete',
-
-  FaceCreate = 'face.create',
-  FaceRead = 'face.read',
-  FaceUpdate = 'face.update',
-  FaceDelete = 'face.delete',
-
   FolderRead = 'folder.read',
-
-  JobCreate = 'job.create',
-  JobRead = 'job.read',
-
-  LibraryCreate = 'library.create',
-  LibraryRead = 'library.read',
-  LibraryUpdate = 'library.update',
-  LibraryDelete = 'library.delete',
-  LibraryStatistics = 'library.statistics',
 
   TimelineRead = 'timeline.read',
   TimelineDownload = 'timeline.download',
-
-  Maintenance = 'maintenance',
-
-  MapRead = 'map.read',
-  MapSearch = 'map.search',
 
   MemoryCreate = 'memory.create',
   MemoryRead = 'memory.read',
@@ -173,11 +142,6 @@ export enum Permission {
 
   MemoryAssetCreate = 'memoryAsset.create',
   MemoryAssetDelete = 'memoryAsset.delete',
-
-  NotificationCreate = 'notification.create',
-  NotificationRead = 'notification.read',
-  NotificationUpdate = 'notification.update',
-  NotificationDelete = 'notification.delete',
 
   PartnerCreate = 'partner.create',
   PartnerRead = 'partner.read',
@@ -195,11 +159,6 @@ export enum Permission {
   PinCodeCreate = 'pinCode.create',
   PinCodeUpdate = 'pinCode.update',
   PinCodeDelete = 'pinCode.delete',
-
-  PluginCreate = 'plugin.create',
-  PluginRead = 'plugin.read',
-  PluginUpdate = 'plugin.update',
-  PluginDelete = 'plugin.delete',
 
   ServerAbout = 'server.about',
   ServerApkLinks = 'server.apkLinks',
@@ -264,19 +223,6 @@ export enum Permission {
   UserProfileImageUpdate = 'userProfileImage.update',
   UserProfileImageDelete = 'userProfileImage.delete',
 
-  QueueRead = 'queue.read',
-  QueueUpdate = 'queue.update',
-
-  QueueJobCreate = 'queueJob.create',
-  QueueJobRead = 'queueJob.read',
-  QueueJobUpdate = 'queueJob.update',
-  QueueJobDelete = 'queueJob.delete',
-
-  WorkflowCreate = 'workflow.create',
-  WorkflowRead = 'workflow.read',
-  WorkflowUpdate = 'workflow.update',
-  WorkflowDelete = 'workflow.delete',
-
   AdminUserCreate = 'adminUser.create',
   AdminUserRead = 'adminUser.read',
   AdminUserUpdate = 'adminUser.update',
@@ -289,34 +235,25 @@ export enum Permission {
 
 export enum SharedLinkType {
   Album = 'ALBUM',
-
-  /**
-   * Individual asset
-   * or group of assets that are not in an album
-   */
+  /** Individual asset or group of assets not in an album */
   Individual = 'INDIVIDUAL',
 }
 
 export enum StorageFolder {
-  EncodedVideo = 'encoded-video',
   Library = 'library',
   Upload = 'upload',
   Profile = 'profile',
   Thumbnails = 'thumbs',
-  Backups = 'backups',
 }
 
 export enum SystemMetadataKey {
-  MediaLocation = 'MediaLocation',
-  ReverseGeocodingState = 'reverse-geocoding-state',
-  FacialRecognitionState = 'facial-recognition-state',
-  MemoriesState = 'memories-state',
   AdminOnboarding = 'admin-onboarding',
   MaintenanceMode = 'maintenance-mode',
   SystemConfig = 'system-config',
   SystemFlags = 'system-flags',
   VersionCheckState = 'version-check-state',
   License = 'license',
+  MemoriesState = 'memories-state',
 }
 
 export enum UserMetadataKey {
@@ -360,18 +297,8 @@ export enum SourceType {
   Manual = 'manual',
 }
 
-export enum ManualJobName {
-  PersonCleanup = 'person-cleanup',
-  TagCleanup = 'tag-cleanup',
-  UserCleanup = 'user-cleanup',
-  MemoryCleanup = 'memory-cleanup',
-  MemoryCreate = 'memory-create',
-  BackupDatabase = 'backup-database',
-}
-
 export enum AssetPathType {
   Original = 'original',
-  EncodedVideo = 'encoded_video',
 }
 
 export enum PersonPathType {
@@ -384,76 +311,9 @@ export enum UserPathType {
 
 export type PathType = AssetFileType | AssetPathType | PersonPathType | UserPathType;
 
-export enum TranscodePolicy {
-  All = 'all',
-  Optimal = 'optimal',
-  Bitrate = 'bitrate',
-  Required = 'required',
-  Disabled = 'disabled',
-}
-
-export enum TranscodeTarget {
-  None = 'NONE',
-  Audio = 'AUDIO',
-  Video = 'VIDEO',
-  All = 'ALL',
-}
-
-export enum VideoCodec {
-  H264 = 'h264',
-  Hevc = 'hevc',
-  Vp9 = 'vp9',
-  Av1 = 'av1',
-}
-
-export enum AudioCodec {
-  Mp3 = 'mp3',
-  Aac = 'aac',
-  LibOpus = 'libopus',
-  PcmS16le = 'pcm_s16le',
-}
-
-export enum VideoContainer {
-  Mov = 'mov',
-  Mp4 = 'mp4',
-  Ogg = 'ogg',
-  Webm = 'webm',
-}
-
-export enum TranscodeHardwareAcceleration {
-  Nvenc = 'nvenc',
-  Qsv = 'qsv',
-  Vaapi = 'vaapi',
-  Rkmpp = 'rkmpp',
-  Disabled = 'disabled',
-}
-
-export enum ToneMapping {
-  Hable = 'hable',
-  Mobius = 'mobius',
-  Reinhard = 'reinhard',
-  Disabled = 'disabled',
-}
-
-export enum CQMode {
-  Auto = 'auto',
-  Cqp = 'cqp',
-  Icq = 'icq',
-}
-
-export enum Colorspace {
-  Srgb = 'srgb',
-  P3 = 'p3',
-}
-
 export enum ImageFormat {
   Jpeg = 'jpeg',
   Webp = 'webp',
-}
-
-export enum RawExtractedFormat {
-  Jpeg = 'jpeg',
-  Jxl = 'jxl',
 }
 
 export enum LogLevel {
@@ -463,11 +323,6 @@ export enum LogLevel {
   Warn = 'warn',
   Error = 'error',
   Fatal = 'fatal',
-}
-
-export enum LogFormat {
-  Console = 'console',
-  Json = 'json',
 }
 
 export enum ApiCustomExtension {
@@ -483,8 +338,6 @@ export enum MetadataKey {
   SharedRoute = 'shared_route',
   ApiKeySecurity = 'api_key',
   EventConfig = 'event_config',
-  JobConfig = 'job_config',
-  TelemetryEnabled = 'telemetry_enabled',
 }
 
 export enum RouteKey {
@@ -504,18 +357,33 @@ export enum ImmichEnvironment {
   Production = 'production',
 }
 
-export enum ImmichWorker {
-  Api = 'api',
-  Maintenance = 'maintenance',
-  Microservices = 'microservices',
+export enum AssetVisibility {
+  Archive = 'archive',
+  Timeline = 'timeline',
+  /** Video part of LivePhotos and MotionPhotos */
+  Hidden = 'hidden',
+  Locked = 'locked',
 }
 
-export enum ImmichTelemetry {
-  Host = 'host',
-  Api = 'api',
-  Io = 'io',
-  Repo = 'repo',
-  Job = 'job',
+export enum NotificationLevel {
+  Success = 'success',
+  Error = 'error',
+  Warning = 'warning',
+  Info = 'info',
+}
+
+export enum NotificationType {
+  JobFailed = 'JobFailed',
+  BackupFailed = 'BackupFailed',
+  SystemMessage = 'SystemMessage',
+  AlbumInvite = 'AlbumInvite',
+  AlbumUpdate = 'AlbumUpdate',
+  Custom = 'Custom',
+}
+
+export enum Colorspace {
+  Srgb = 'srgb',
+  P3 = 'p3',
 }
 
 export enum ExifOrientation {
@@ -527,189 +395,6 @@ export enum ExifOrientation {
   Rotate90CW = 6,
   MirrorHorizontalRotate90CW = 7,
   Rotate270CW = 8,
-}
-
-export enum DatabaseExtension {
-  Cube = 'cube',
-  EarthDistance = 'earthdistance',
-  Vector = 'vector',
-  Vectors = 'vectors',
-  VectorChord = 'vchord',
-}
-
-export enum BootstrapEventPriority {
-  // Database service should be initialized before anything else, most other services need database access
-  DatabaseService = -200,
-  // Detect and configure the media location before jobs are queued which may use it
-  StorageService = -195,
-  // Other services may need to queue jobs on bootstrap.
-  JobService = -190,
-  // Initialise config after other bootstrap services, stop other services from using config on bootstrap
-  SystemConfig = 100,
-}
-
-export enum QueueName {
-  ThumbnailGeneration = 'thumbnailGeneration',
-  MetadataExtraction = 'metadataExtraction',
-  VideoConversion = 'videoConversion',
-  FaceDetection = 'faceDetection',
-  FacialRecognition = 'facialRecognition',
-  SmartSearch = 'smartSearch',
-  DuplicateDetection = 'duplicateDetection',
-  BackgroundTask = 'backgroundTask',
-  StorageTemplateMigration = 'storageTemplateMigration',
-  Migration = 'migration',
-  Search = 'search',
-  Sidecar = 'sidecar',
-  Library = 'library',
-  Notification = 'notifications',
-  BackupDatabase = 'backupDatabase',
-  Ocr = 'ocr',
-  Workflow = 'workflow',
-  Editor = 'editor',
-}
-
-export enum QueueJobStatus {
-  Active = 'active',
-  Failed = 'failed',
-  Complete = 'completed',
-  Delayed = 'delayed',
-  Waiting = 'waiting',
-  Paused = 'paused',
-}
-
-export enum JobName {
-  AssetDelete = 'AssetDelete',
-  AssetDeleteCheck = 'AssetDeleteCheck',
-  AssetDetectFacesQueueAll = 'AssetDetectFacesQueueAll',
-  AssetDetectFaces = 'AssetDetectFaces',
-  AssetDetectDuplicatesQueueAll = 'AssetDetectDuplicatesQueueAll',
-  AssetDetectDuplicates = 'AssetDetectDuplicates',
-  AssetEditThumbnailGeneration = 'AssetEditThumbnailGeneration',
-  AssetEncodeVideoQueueAll = 'AssetEncodeVideoQueueAll',
-  AssetEncodeVideo = 'AssetEncodeVideo',
-  AssetEmptyTrash = 'AssetEmptyTrash',
-  AssetExtractMetadataQueueAll = 'AssetExtractMetadataQueueAll',
-  AssetExtractMetadata = 'AssetExtractMetadata',
-  AssetFileMigration = 'AssetFileMigration',
-  AssetGenerateThumbnailsQueueAll = 'AssetGenerateThumbnailsQueueAll',
-  AssetGenerateThumbnails = 'AssetGenerateThumbnails',
-
-  AuditLogCleanup = 'AuditLogCleanup',
-  AuditTableCleanup = 'AuditTableCleanup',
-
-  DatabaseBackup = 'DatabaseBackup',
-
-  FacialRecognitionQueueAll = 'FacialRecognitionQueueAll',
-  FacialRecognition = 'FacialRecognition',
-
-  FileDelete = 'FileDelete',
-  FileMigrationQueueAll = 'FileMigrationQueueAll',
-
-  LibraryDeleteCheck = 'LibraryDeleteCheck',
-  LibraryDelete = 'LibraryDelete',
-  LibraryRemoveAsset = 'LibraryRemoveAsset',
-  LibrarySyncAssetsQueueAll = 'LibraryScanAssetsQueueAll',
-  LibrarySyncAssets = 'LibrarySyncAssets',
-  LibrarySyncFilesQueueAll = 'LibrarySyncFilesQueueAll',
-  LibrarySyncFiles = 'LibrarySyncFiles',
-  LibraryScanQueueAll = 'LibraryScanQueueAll',
-
-  MemoryCleanup = 'MemoryCleanup',
-  MemoryGenerate = 'MemoryGenerate',
-
-  NotificationsCleanup = 'NotificationsCleanup',
-
-  NotifyUserSignup = 'NotifyUserSignup',
-  NotifyAlbumInvite = 'NotifyAlbumInvite',
-  NotifyAlbumUpdate = 'NotifyAlbumUpdate',
-
-  UserDelete = 'UserDelete',
-  UserDeleteCheck = 'UserDeleteCheck',
-  UserSyncUsage = 'UserSyncUsage',
-
-  PersonCleanup = 'PersonCleanup',
-  PersonFileMigration = 'PersonFileMigration',
-  PersonGenerateThumbnail = 'PersonGenerateThumbnail',
-
-  SessionCleanup = 'SessionCleanup',
-
-  SendMail = 'SendMail',
-
-  SidecarQueueAll = 'SidecarQueueAll',
-  SidecarCheck = 'SidecarCheck',
-  SidecarWrite = 'SidecarWrite',
-
-  SmartSearchQueueAll = 'SmartSearchQueueAll',
-  SmartSearch = 'SmartSearch',
-
-  StorageTemplateMigration = 'StorageTemplateMigration',
-  StorageTemplateMigrationSingle = 'StorageTemplateMigrationSingle',
-
-  TagCleanup = 'TagCleanup',
-
-  VersionCheck = 'VersionCheck',
-
-  // OCR
-  OcrQueueAll = 'OcrQueueAll',
-  Ocr = 'Ocr',
-
-  // Workflow
-  WorkflowRun = 'WorkflowRun',
-}
-
-export enum QueueCommand {
-  Start = 'start',
-  /** @deprecated Use `updateQueue` instead */
-  Pause = 'pause',
-  /** @deprecated Use `updateQueue` instead */
-  Resume = 'resume',
-  /** @deprecated Use `emptyQueue` instead */
-  Empty = 'empty',
-  /** @deprecated Use `emptyQueue` instead */
-  ClearFailed = 'clear-failed',
-}
-
-export enum JobStatus {
-  Success = 'success',
-  Failed = 'failed',
-  Skipped = 'skipped',
-}
-
-export enum QueueCleanType {
-  Failed = 'failed',
-}
-
-export enum VectorIndex {
-  Clip = 'clip_index',
-  Face = 'face_index',
-}
-
-export enum DatabaseLock {
-  GeodataImport = 100,
-  Migrations = 200,
-  SystemFileMounts = 300,
-  StorageTemplateMigration = 420,
-  VersionHistory = 500,
-  CLIPDimSize = 512,
-  Library = 1337,
-  NightlyJobs = 600,
-  MediaLocation = 700,
-  GetSystemConfig = 69,
-  BackupDatabase = 42,
-  MaintenanceOperation = 621,
-  MemoryCreation = 777,
-}
-
-export enum MaintenanceAction {
-  Start = 'start',
-  End = 'end',
-  SelectDatabaseRestore = 'select_database_restore',
-  RestoreDatabase = 'restore_database',
-}
-
-export enum ExitCode {
-  AppRestart = 7,
 }
 
 export enum SyncRequestType {
@@ -800,51 +485,6 @@ export enum SyncEntityType {
   SyncCompleteV1 = 'SyncCompleteV1',
 }
 
-export enum NotificationLevel {
-  Success = 'success',
-  Error = 'error',
-  Warning = 'warning',
-  Info = 'info',
-}
-
-export enum NotificationType {
-  JobFailed = 'JobFailed',
-  BackupFailed = 'BackupFailed',
-  SystemMessage = 'SystemMessage',
-  AlbumInvite = 'AlbumInvite',
-  AlbumUpdate = 'AlbumUpdate',
-  Custom = 'Custom',
-}
-
-export enum OAuthTokenEndpointAuthMethod {
-  ClientSecretPost = 'client_secret_post',
-  ClientSecretBasic = 'client_secret_basic',
-}
-
-export enum DatabaseSslMode {
-  Disable = 'disable',
-  Allow = 'allow',
-  Prefer = 'prefer',
-  Require = 'require',
-  VerifyFull = 'verify-full',
-}
-
-export enum AssetVisibility {
-  Archive = 'archive',
-  Timeline = 'timeline',
-
-  /**
-   * Video part of the LivePhotos and MotionPhotos
-   */
-  Hidden = 'hidden',
-  Locked = 'locked',
-}
-
-export enum CronJob {
-  LibraryScan = 'LibraryScan',
-  NightlyJobs = 'NightlyJobs',
-}
-
 export enum ApiTag {
   Activities = 'Activities',
   Albums = 'Albums',
@@ -852,22 +492,10 @@ export enum ApiTag {
   Authentication = 'Authentication',
   AuthenticationAdmin = 'Authentication (admin)',
   Assets = 'Assets',
-  DatabaseBackups = 'Database Backups (admin)',
-  Deprecated = 'Deprecated',
   Download = 'Download',
-  Duplicates = 'Duplicates',
-  Faces = 'Faces',
-  Jobs = 'Jobs',
-  Libraries = 'Libraries',
-  Maintenance = 'Maintenance (admin)',
   Map = 'Map',
   Memories = 'Memories',
-  Notifications = 'Notifications',
-  NotificationsAdmin = 'Notifications (admin)',
   Partners = 'Partners',
-  People = 'People',
-  Plugins = 'Plugins',
-  Queues = 'Queues',
   Search = 'Search',
   Server = 'Server',
   Sessions = 'Sessions',
@@ -882,16 +510,5 @@ export enum ApiTag {
   UsersAdmin = 'Users (admin)',
   Users = 'Users',
   Views = 'Views',
-  Workflows = 'Workflows',
 }
 
-export enum PluginContext {
-  Asset = 'asset',
-  Album = 'album',
-  Person = 'person',
-}
-
-export enum PluginTriggerType {
-  AssetCreate = 'AssetCreate',
-  PersonRecognized = 'PersonRecognized',
-}

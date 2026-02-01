@@ -1,58 +1,115 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Transform } from 'class-transformer';
-import { IsEmail, IsInt, IsNotEmpty, IsString, Min } from 'class-validator';
+import { z } from 'zod';
 import { User, UserAdmin } from 'src/database';
 import { UserAvatarColor, UserMetadataKey, UserStatus } from 'src/enum';
 import { UserMetadataItem } from 'src/types';
-import { Optional, PinCode, ValidateBoolean, ValidateEnum, ValidateUUID, toEmail, toSanitized } from 'src/validation';
+import { optionalBooleanQuery } from 'src/validation';
 
-export class UserUpdateMeDto {
-  @ApiPropertyOptional({ description: 'User email' })
-  @Optional()
-  @IsEmail({ require_tld: false })
-  @Transform(toEmail)
-  email?: string;
+// --- Request Schemas ---
 
-  // TODO: migrate to the other change password endpoint
-  @ApiPropertyOptional({ description: 'User password (deprecated, use change password endpoint)' })
-  @Optional()
-  @IsNotEmpty()
-  @IsString()
-  password?: string;
+export const UserUpdateMeSchema = z.object({
+  email: z.string().email().transform((v) => v.toLowerCase()).optional(),
+  password: z.string().min(1).optional(),
+  name: z.string().min(1).optional(),
+  avatarColor: z.nativeEnum(UserAvatarColor).nullable().optional(),
+});
+export type UserUpdateMeDto = z.infer<typeof UserUpdateMeSchema>;
 
-  @ApiPropertyOptional({ description: 'User name' })
-  @Optional()
-  @IsString()
-  @IsNotEmpty()
-  name?: string;
+export const UserAdminSearchSchema = z.object({
+  withDeleted: optionalBooleanQuery,
+  id: z.string().uuid().optional(),
+});
+export type UserAdminSearchDto = z.infer<typeof UserAdminSearchSchema>;
 
-  @ValidateEnum({ enum: UserAvatarColor, name: 'UserAvatarColor', optional: true, description: 'Avatar color' })
-  avatarColor?: UserAvatarColor | null;
+export const UserAdminCreateSchema = z.object({
+  email: z.string().email().transform((v) => v.toLowerCase()),
+  password: z.string().min(1),
+  name: z.string().min(1),
+  avatarColor: z.nativeEnum(UserAvatarColor).nullable().optional(),
+  storageLabel: z.string().nullable().optional().transform((v) => {
+    if (typeof v !== 'string') return v;
+    return v.replaceAll('.', '').replace(/[^\w\s-]/g, '');
+  }),
+  quotaSizeInBytes: z.number().int().min(0).nullable().optional(),
+  shouldChangePassword: z.preprocess((val) => {
+    if (val === 'true' || val === true) return true;
+    if (val === 'false' || val === false) return false;
+    return val;
+  }, z.boolean().optional()),
+  notify: z.preprocess((val) => {
+    if (val === 'true' || val === true) return true;
+    if (val === 'false' || val === false) return false;
+    return val;
+  }, z.boolean().optional()),
+  isAdmin: z.preprocess((val) => {
+    if (val === 'true' || val === true) return true;
+    if (val === 'false' || val === false) return false;
+    return val;
+  }, z.boolean().optional()),
+});
+export type UserAdminCreateDto = z.infer<typeof UserAdminCreateSchema>;
+
+export const UserAdminUpdateSchema = z.object({
+  email: z.string().email().transform((v) => v.toLowerCase()).optional(),
+  password: z.string().min(1).optional(),
+  pinCode: z.string().regex(/^\d{6}$/, { message: 'Must be a 6-digit numeric string' }).nullable().optional()
+    .transform((v) => (v === '' ? null : v)),
+  name: z.string().min(1).optional(),
+  avatarColor: z.nativeEnum(UserAvatarColor).nullable().optional(),
+  storageLabel: z.string().nullable().optional().transform((v) => {
+    if (typeof v !== 'string') return v;
+    return v.replaceAll('.', '').replace(/[^\w\s-]/g, '');
+  }),
+  shouldChangePassword: z.preprocess((val) => {
+    if (val === 'true' || val === true) return true;
+    if (val === 'false' || val === false) return false;
+    return val;
+  }, z.boolean().optional()),
+  quotaSizeInBytes: z.number().int().min(0).nullable().optional(),
+  isAdmin: z.preprocess((val) => {
+    if (val === 'true' || val === true) return true;
+    if (val === 'false' || val === false) return false;
+    return val;
+  }, z.boolean().optional()),
+});
+export type UserAdminUpdateDto = z.infer<typeof UserAdminUpdateSchema>;
+
+export const UserAdminDeleteSchema = z.object({
+  force: optionalBooleanQuery,
+});
+export type UserAdminDeleteDto = z.infer<typeof UserAdminDeleteSchema>;
+
+// --- Response DTOs (plain interfaces) ---
+
+export interface UserResponseDto {
+  id: string;
+  name: string;
+  email: string;
+  profileImagePath: string;
+  avatarColor: UserAvatarColor;
+  profileChangedAt: string | Date;
 }
 
-export class UserResponseDto {
-  @ApiProperty({ description: 'User ID' })
-  id!: string;
-  @ApiProperty({ description: 'User name' })
-  name!: string;
-  @ApiProperty({ description: 'User email' })
-  email!: string;
-  @ApiProperty({ description: 'Profile image path' })
-  profileImagePath!: string;
-  @ValidateEnum({ enum: UserAvatarColor, name: 'UserAvatarColor', description: 'Avatar color' })
-  avatarColor!: UserAvatarColor;
-  @ApiProperty({ description: 'Profile change date' })
-  profileChangedAt!: Date;
+export interface UserLicense {
+  licenseKey: string;
+  activationKey: string;
+  activatedAt: Date;
 }
 
-export class UserLicense {
-  @ApiProperty({ description: 'License key' })
-  licenseKey!: string;
-  @ApiProperty({ description: 'Activation key' })
-  activationKey!: string;
-  @ApiProperty({ description: 'Activation date' })
-  activatedAt!: Date;
+export interface UserAdminResponseDto extends UserResponseDto {
+  storageLabel: string | null;
+  shouldChangePassword: boolean;
+  isAdmin: boolean;
+  createdAt: string | Date;
+  deletedAt: string | Date | null;
+  updatedAt: string | Date;
+  oauthId: string;
+  quotaSizeInBytes: number | null;
+  quotaUsageInBytes: number | null;
+  status: string;
+  license: UserLicense | null;
 }
+
+// --- Mappers ---
 
 const emailToAvatarColor = (email: string): UserAvatarColor => {
   const values = Object.values(UserAvatarColor);
@@ -72,129 +129,6 @@ export const mapUser = (entity: User | UserAdmin): UserResponseDto => {
     profileChangedAt: entity.profileChangedAt,
   };
 };
-
-export class UserAdminSearchDto {
-  @ValidateBoolean({ optional: true, description: 'Include deleted users' })
-  withDeleted?: boolean;
-
-  @ValidateUUID({ optional: true, description: 'User ID filter' })
-  id?: string;
-}
-
-export class UserAdminCreateDto {
-  @ApiProperty({ description: 'User email' })
-  @IsEmail({ require_tld: false })
-  @Transform(toEmail)
-  email!: string;
-
-  @ApiProperty({ description: 'User password' })
-  @IsString()
-  password!: string;
-
-  @ApiProperty({ description: 'User name' })
-  @IsNotEmpty()
-  @IsString()
-  name!: string;
-
-  @ValidateEnum({ enum: UserAvatarColor, name: 'UserAvatarColor', optional: true, description: 'Avatar color' })
-  avatarColor?: UserAvatarColor | null;
-
-  @ApiPropertyOptional({ description: 'Storage label' })
-  @Optional({ nullable: true })
-  @IsString()
-  @Transform(toSanitized)
-  storageLabel?: string | null;
-
-  @ApiPropertyOptional({ type: 'integer', format: 'int64', description: 'Storage quota in bytes' })
-  @Optional({ nullable: true })
-  @IsInt()
-  @Min(0)
-  quotaSizeInBytes?: number | null;
-
-  @ValidateBoolean({ optional: true, description: 'Require password change on next login' })
-  shouldChangePassword?: boolean;
-
-  @ValidateBoolean({ optional: true, description: 'Send notification email' })
-  notify?: boolean;
-
-  @ValidateBoolean({ optional: true, description: 'Grant admin privileges' })
-  isAdmin?: boolean;
-}
-
-export class UserAdminUpdateDto {
-  @ApiPropertyOptional({ description: 'User email' })
-  @Optional()
-  @IsEmail({ require_tld: false })
-  @Transform(toEmail)
-  email?: string;
-
-  @ApiPropertyOptional({ description: 'User password' })
-  @Optional()
-  @IsNotEmpty()
-  @IsString()
-  password?: string;
-
-  @ApiPropertyOptional({ description: 'PIN code' })
-  @PinCode({ optional: true, emptyToNull: true })
-  pinCode?: string | null;
-
-  @ApiPropertyOptional({ description: 'User name' })
-  @Optional()
-  @IsString()
-  @IsNotEmpty()
-  name?: string;
-
-  @ValidateEnum({ enum: UserAvatarColor, name: 'UserAvatarColor', optional: true, description: 'Avatar color' })
-  avatarColor?: UserAvatarColor | null;
-
-  @ApiPropertyOptional({ description: 'Storage label' })
-  @Optional({ nullable: true })
-  @IsString()
-  @Transform(toSanitized)
-  storageLabel?: string | null;
-
-  @ValidateBoolean({ optional: true, description: 'Require password change on next login' })
-  shouldChangePassword?: boolean;
-
-  @ApiPropertyOptional({ type: 'integer', format: 'int64', description: 'Storage quota in bytes' })
-  @Optional({ nullable: true })
-  @IsInt()
-  @Min(0)
-  quotaSizeInBytes?: number | null;
-
-  @ValidateBoolean({ optional: true, description: 'Grant admin privileges' })
-  isAdmin?: boolean;
-}
-
-export class UserAdminDeleteDto {
-  @ValidateBoolean({ optional: true, description: 'Force delete even if user has assets' })
-  force?: boolean;
-}
-
-export class UserAdminResponseDto extends UserResponseDto {
-  @ApiProperty({ description: 'Storage label' })
-  storageLabel!: string | null;
-  @ApiProperty({ description: 'Require password change on next login' })
-  shouldChangePassword!: boolean;
-  @ApiProperty({ description: 'Is admin user' })
-  isAdmin!: boolean;
-  @ApiProperty({ description: 'Creation date' })
-  createdAt!: Date;
-  @ApiProperty({ description: 'Deletion date' })
-  deletedAt!: Date | null;
-  @ApiProperty({ description: 'Last update date' })
-  updatedAt!: Date;
-  @ApiProperty({ description: 'OAuth ID' })
-  oauthId!: string;
-  @ApiProperty({ type: 'integer', format: 'int64', description: 'Storage quota in bytes' })
-  quotaSizeInBytes!: number | null;
-  @ApiProperty({ type: 'integer', format: 'int64', description: 'Storage usage in bytes' })
-  quotaUsageInBytes!: number | null;
-  @ValidateEnum({ enum: UserStatus, name: 'UserStatus', description: 'User status' })
-  status!: string;
-  @ApiProperty({ description: 'User license' })
-  license!: UserLicense | null;
-}
 
 export function mapUserAdmin(entity: UserAdmin): UserAdminResponseDto {
   const metadata = entity.metadata || [];

@@ -1,80 +1,110 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
-import { BulkIdsDto } from 'src/dtos/asset-ids.response.dto';
-import { AuthDto } from 'src/dtos/auth.dto';
-import { StackCreateDto, StackResponseDto, StackSearchDto, StackUpdateDto, mapStack } from 'src/dtos/stack.dto';
-import { Permission } from 'src/enum';
-import { BaseService } from 'src/services/base.service';
-import { UUIDAssetIDParamDto } from 'src/validation';
+/**
+ * Stack service -- Workers-compatible version.
+ *
+ * Core business logic for stack CRUD operations.
+ * No NestJS decorators, no BaseService, no job queues.
+ */
 
-@Injectable()
-export class StackService extends BaseService {
-  async search(auth: AuthDto, dto: StackSearchDto): Promise<StackResponseDto[]> {
+import type { AuthDto } from 'src/dtos/auth.dto';
+import { Permission } from 'src/enum';
+import type { ServiceContext } from 'src/context';
+import { AccessRepository } from 'src/repositories/access.repository';
+import { StackRepository } from 'src/repositories/stack.repository';
+import { AssetRepository } from 'src/repositories/asset.repository';
+import { requireAccess } from 'src/utils/access';
+
+export class StackService {
+  private stackRepository: StackRepository;
+  private accessRepository: AccessRepository;
+  private assetRepository: AssetRepository;
+
+  constructor(private ctx: ServiceContext) {
+    this.stackRepository = new StackRepository(ctx.db);
+    this.accessRepository = new AccessRepository(ctx.db);
+    this.assetRepository = new AssetRepository(ctx.db);
+  }
+
+  async search(auth: AuthDto, dto: any) {
     const stacks = await this.stackRepository.search({
       ownerId: auth.user.id,
       primaryAssetId: dto.primaryAssetId,
     });
-
-    return stacks.map((stack) => mapStack(stack, { auth }));
+    return stacks;
   }
 
-  async create(auth: AuthDto, dto: StackCreateDto): Promise<StackResponseDto> {
-    await this.requireAccess({ auth, permission: Permission.AssetUpdate, ids: dto.assetIds });
+  async create(auth: AuthDto, dto: any) {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.AssetUpdate,
+      ids: dto.assetIds,
+    });
 
     const stack = await this.stackRepository.create({ ownerId: auth.user.id }, dto.assetIds);
-
-    await this.eventRepository.emit('StackCreate', { stackId: stack.id, userId: auth.user.id });
-
-    return mapStack(stack, { auth });
+    return stack;
   }
 
-  async get(auth: AuthDto, id: string): Promise<StackResponseDto> {
-    await this.requireAccess({ auth, permission: Permission.StackRead, ids: [id] });
+  async get(auth: AuthDto, id: string) {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.StackRead,
+      ids: [id],
+    });
     const stack = await this.findOrFail(id);
-    return mapStack(stack, { auth });
+    return stack;
   }
 
-  async update(auth: AuthDto, id: string, dto: StackUpdateDto): Promise<StackResponseDto> {
-    await this.requireAccess({ auth, permission: Permission.StackUpdate, ids: [id] });
+  async update(auth: AuthDto, id: string, dto: any) {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.StackUpdate,
+      ids: [id],
+    });
     const stack = await this.findOrFail(id);
-    if (dto.primaryAssetId && !stack.assets.some(({ id }) => id === dto.primaryAssetId)) {
-      throw new BadRequestException('Primary asset must be in the stack');
+    if (dto.primaryAssetId && !stack.assets?.some((a: any) => a.id === dto.primaryAssetId)) {
+      throw new Error('Primary asset must be in the stack');
     }
 
     const updatedStack = await this.stackRepository.update(id, { id, primaryAssetId: dto.primaryAssetId });
-
-    await this.eventRepository.emit('StackUpdate', { stackId: id, userId: auth.user.id });
-
-    return mapStack(updatedStack, { auth });
+    return updatedStack;
   }
 
   async delete(auth: AuthDto, id: string): Promise<void> {
-    await this.requireAccess({ auth, permission: Permission.StackDelete, ids: [id] });
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.StackDelete,
+      ids: [id],
+    });
     await this.stackRepository.delete(id);
-    await this.eventRepository.emit('StackDelete', { stackId: id, userId: auth.user.id });
   }
 
-  async deleteAll(auth: AuthDto, dto: BulkIdsDto): Promise<void> {
-    await this.requireAccess({ auth, permission: Permission.StackDelete, ids: dto.ids });
+  async deleteAll(auth: AuthDto, dto: { ids: string[] }): Promise<void> {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.StackDelete,
+      ids: dto.ids,
+    });
     await this.stackRepository.deleteAll(dto.ids);
-    await this.eventRepository.emit('StackDeleteAll', { stackIds: dto.ids, userId: auth.user.id });
   }
 
-  async removeAsset(auth: AuthDto, dto: UUIDAssetIDParamDto): Promise<void> {
+  async removeAsset(auth: AuthDto, dto: { id: string; assetId: string }): Promise<void> {
     const { id: stackId, assetId } = dto;
-    await this.requireAccess({ auth, permission: Permission.StackUpdate, ids: [stackId] });
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.StackUpdate,
+      ids: [stackId],
+    });
 
     const stack = await this.stackRepository.getForAssetRemoval(assetId);
 
     if (!stack?.id || stack.id !== stackId) {
-      throw new BadRequestException('Asset not in stack');
+      throw new Error('Asset not in stack');
     }
 
     if (stack.primaryAssetId === assetId) {
-      throw new BadRequestException("Cannot remove stack's primary asset");
+      throw new Error("Cannot remove stack's primary asset");
     }
 
     await this.assetRepository.update({ id: assetId, stackId: null });
-    await this.eventRepository.emit('StackUpdate', { stackId, userId: auth.user.id });
   }
 
   private async findOrFail(id: string) {
@@ -82,7 +112,6 @@ export class StackService extends BaseService {
     if (!stack) {
       throw new Error('Asset stack not found');
     }
-
     return stack;
   }
 }

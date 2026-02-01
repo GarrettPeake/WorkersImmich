@@ -1,0 +1,1 @@
+import{a0 as r}from"./D0CSSuTl.js";const s=r({isDragging:!1,files:[]});export{s as d};

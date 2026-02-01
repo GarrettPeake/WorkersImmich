@@ -1,210 +1,248 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
-import { LRUMap } from 'mnemonist';
-import { AssetMapOptions, AssetResponseDto, MapAsset, mapAsset } from 'src/dtos/asset-response.dto';
-import { AuthDto } from 'src/dtos/auth.dto';
-import { mapPerson, PersonResponseDto } from 'src/dtos/person.dto';
-import {
-  LargeAssetSearchDto,
-  mapPlaces,
-  MetadataSearchDto,
-  PlacesResponseDto,
-  RandomSearchDto,
-  SearchPeopleDto,
-  SearchPlacesDto,
-  SearchResponseDto,
-  SearchStatisticsResponseDto,
-  SearchSuggestionRequestDto,
-  SearchSuggestionType,
-  SmartSearchDto,
-  StatisticsSearchDto,
-} from 'src/dtos/search.dto';
-import { AssetOrder, AssetVisibility, Permission } from 'src/enum';
-import { BaseService } from 'src/services/base.service';
-import { requireElevatedPermission } from 'src/utils/access';
-import { getMyPartnerIds } from 'src/utils/asset.util';
-import { isSmartSearchEnabled } from 'src/utils/misc';
+/**
+ * Search service -- Workers-compatible version.
+ *
+ * Simplified metadata-only search that queries D1 directly.
+ * No ML/smart search, no CLIP embeddings.
+ */
 
-@Injectable()
-export class SearchService extends BaseService {
-  private embeddingCache = new LRUMap<string, string>(100);
+import type { AuthDto } from 'src/dtos/auth.dto';
+import { AssetType, AssetVisibility } from 'src/enum';
+import type { ServiceContext } from 'src/context';
+import { mapAsset, AssetResponseDto } from 'src/dtos/asset-response.dto';
 
-  async searchPerson(auth: AuthDto, dto: SearchPeopleDto): Promise<PersonResponseDto[]> {
-    const people = await this.personRepository.getByName(auth.user.id, dto.name, { withHidden: dto.withHidden });
-    return people.map((person) => mapPerson(person));
+export class SearchService {
+  private get db() {
+    return this.ctx.db;
   }
 
-  async searchPlaces(dto: SearchPlacesDto): Promise<PlacesResponseDto[]> {
-    const places = await this.searchRepository.searchPlaces(dto.name);
-    return places.map((place) => mapPlaces(place));
-  }
+  constructor(private ctx: ServiceContext) {}
 
-  async getExploreData(auth: AuthDto) {
-    const options = { maxFields: 12, minAssetsPerField: 5 };
-    const cities = await this.assetRepository.getAssetIdByCity(auth.user.id, options);
-    const assets = await this.assetRepository.getByIdsWithAllRelationsButStacks(cities.items.map(({ data }) => data));
-    const items = assets.map((asset) => ({ value: asset.exifInfo!.city!, data: mapAsset(asset, { auth }) }));
-    return [{ fieldName: cities.fieldName, items }];
-  }
-
-  async searchMetadata(auth: AuthDto, dto: MetadataSearchDto): Promise<SearchResponseDto> {
-    if (dto.visibility === AssetVisibility.Locked) {
-      requireElevatedPermission(auth);
-    }
-
-    let checksum: Buffer | undefined;
-    if (dto.checksum) {
-      const encoding = dto.checksum.length === 28 ? 'base64' : 'hex';
-      checksum = Buffer.from(dto.checksum, encoding);
-    }
-
+  /**
+   * Search assets by metadata (date, location, type, etc.)
+   */
+  async searchMetadata(auth: AuthDto, dto: {
+    originalFileName?: string;
+    city?: string;
+    state?: string;
+    country?: string;
+    make?: string;
+    model?: string;
+    type?: string;
+    isFavorite?: boolean;
+    isVisible?: boolean;
+    page?: number;
+    size?: number;
+  }) {
     const page = dto.page ?? 1;
-    const size = dto.size || 250;
-    const userIds = await this.getUserIdsToSearch(auth);
-    const { hasNextPage, items } = await this.searchRepository.searchMetadata(
-      { page, size },
-      {
-        ...dto,
-        checksum,
-        userIds,
-        orderDirection: dto.order ?? AssetOrder.Desc,
-      },
-    );
+    const size = dto.size ?? 250;
+    const offset = (page - 1) * size;
 
-    return this.mapResponse(items, hasNextPage ? (page + 1).toString() : null, { auth });
-  }
+    let query = this.db
+      .selectFrom('asset')
+      .leftJoin('asset_exif', 'asset_exif.assetId', 'asset.id')
+      .selectAll('asset')
+      .where('asset.ownerId', '=', auth.user.id)
+      .where('asset.deletedAt', 'is', null);
 
-  async searchStatistics(auth: AuthDto, dto: StatisticsSearchDto): Promise<SearchStatisticsResponseDto> {
-    const userIds = await this.getUserIdsToSearch(auth);
-
-    return await this.searchRepository.searchStatistics({
-      ...dto,
-      userIds,
-    });
-  }
-
-  async searchRandom(auth: AuthDto, dto: RandomSearchDto): Promise<AssetResponseDto[]> {
-    if (dto.visibility === AssetVisibility.Locked) {
-      requireElevatedPermission(auth);
+    if (dto.originalFileName) {
+      query = query.where('asset.originalFileName', 'like', `%${dto.originalFileName}%`);
     }
 
-    const userIds = await this.getUserIdsToSearch(auth);
-    const items = await this.searchRepository.searchRandom(dto.size || 250, { ...dto, userIds });
-    return items.map((item) => mapAsset(item, { auth }));
-  }
-
-  async searchLargeAssets(auth: AuthDto, dto: LargeAssetSearchDto): Promise<AssetResponseDto[]> {
-    if (dto.visibility === AssetVisibility.Locked) {
-      requireElevatedPermission(auth);
+    if (dto.city) {
+      query = query.where('asset_exif.city', 'like', `%${dto.city}%`);
     }
 
-    const userIds = await this.getUserIdsToSearch(auth);
-    const items = await this.searchRepository.searchLargeAssets(dto.size || 250, { ...dto, userIds });
-    return items.map((item) => mapAsset(item, { auth }));
-  }
-
-  async searchSmart(auth: AuthDto, dto: SmartSearchDto): Promise<SearchResponseDto> {
-    if (dto.visibility === AssetVisibility.Locked) {
-      requireElevatedPermission(auth);
+    if (dto.state) {
+      query = query.where('asset_exif.state', 'like', `%${dto.state}%`);
     }
 
-    const { machineLearning } = await this.getConfig({ withCache: false });
-    if (!isSmartSearchEnabled(machineLearning)) {
-      throw new BadRequestException('Smart search is not enabled');
+    if (dto.country) {
+      query = query.where('asset_exif.country', 'like', `%${dto.country}%`);
     }
 
-    const userIds = this.getUserIdsToSearch(auth);
-    let embedding;
-    if (dto.query) {
-      const key = machineLearning.clip.modelName + dto.query + dto.language;
-      embedding = this.embeddingCache.get(key);
-      if (!embedding) {
-        embedding = await this.machineLearningRepository.encodeText(dto.query, {
-          modelName: machineLearning.clip.modelName,
-          language: dto.language,
-        });
-        this.embeddingCache.set(key, embedding);
-      }
-    } else if (dto.queryAssetId) {
-      await this.requireAccess({ auth, permission: Permission.AssetRead, ids: [dto.queryAssetId] });
-      const getEmbeddingResponse = await this.searchRepository.getEmbedding(dto.queryAssetId);
-      const assetEmbedding = getEmbeddingResponse?.embedding;
-      if (!assetEmbedding) {
-        throw new BadRequestException(`Asset ${dto.queryAssetId} has no embedding`);
-      }
-      embedding = assetEmbedding;
-    } else {
-      throw new BadRequestException('Either `query` or `queryAssetId` must be set');
+    if (dto.make) {
+      query = query.where('asset_exif.make', 'like', `%${dto.make}%`);
     }
-    const page = dto.page ?? 1;
-    const size = dto.size || 100;
-    const { hasNextPage, items } = await this.searchRepository.searchSmart(
-      { page, size },
-      { ...dto, userIds: await userIds, embedding },
-    );
 
-    return this.mapResponse(items, hasNextPage ? (page + 1).toString() : null, { auth });
-  }
-
-  async getAssetsByCity(auth: AuthDto): Promise<AssetResponseDto[]> {
-    const userIds = await this.getUserIdsToSearch(auth);
-    const assets = await this.searchRepository.getAssetsByCity(userIds);
-    return assets.map((asset) => mapAsset(asset));
-  }
-
-  async getSearchSuggestions(auth: AuthDto, dto: SearchSuggestionRequestDto) {
-    const userIds = await this.getUserIdsToSearch(auth);
-    const suggestions = await this.getSuggestions(userIds, dto);
-    if (dto.includeNull) {
-      suggestions.push(null);
+    if (dto.model) {
+      query = query.where('asset_exif.model', 'like', `%${dto.model}%`);
     }
-    return suggestions;
-  }
 
-  private getSuggestions(userIds: string[], dto: SearchSuggestionRequestDto): Promise<Array<string | null>> {
-    switch (dto.type) {
-      case SearchSuggestionType.COUNTRY: {
-        return this.searchRepository.getCountries(userIds);
-      }
-      case SearchSuggestionType.STATE: {
-        return this.searchRepository.getStates(userIds, dto);
-      }
-      case SearchSuggestionType.CITY: {
-        return this.searchRepository.getCities(userIds, dto);
-      }
-      case SearchSuggestionType.CAMERA_MAKE: {
-        return this.searchRepository.getCameraMakes(userIds, dto);
-      }
-      case SearchSuggestionType.CAMERA_MODEL: {
-        return this.searchRepository.getCameraModels(userIds, dto);
-      }
-      case SearchSuggestionType.CAMERA_LENS_MODEL: {
-        return this.searchRepository.getCameraLensModels(userIds, dto);
-      }
-      default: {
-        return Promise.resolve([]);
-      }
+    if (dto.type) {
+      query = query.where('asset.type', '=', dto.type);
     }
-  }
 
-  private async getUserIdsToSearch(auth: AuthDto): Promise<string[]> {
-    const partnerIds = await getMyPartnerIds({
-      userId: auth.user.id,
-      repository: this.partnerRepository,
-      timelineEnabled: true,
-    });
-    return [auth.user.id, ...partnerIds];
-  }
+    if (dto.isFavorite !== undefined) {
+      query = query.where('asset.isFavorite', '=', dto.isFavorite ? 1 : 0);
+    }
 
-  private mapResponse(assets: MapAsset[], nextPage: string | null, options: AssetMapOptions): SearchResponseDto {
+    query = query
+      .orderBy('asset.fileCreatedAt', 'desc')
+      .limit(size)
+      .offset(offset);
+
+    const assets = await query.execute();
     return {
-      albums: { total: 0, count: 0, items: [], facets: [] },
       assets: {
         total: assets.length,
         count: assets.length,
-        items: assets.map((asset) => mapAsset(asset, options)),
+        items: assets.map((a: any) => mapAsset(a, { auth })),
         facets: [],
-        nextPage,
+        nextPage: assets.length === size ? `${page + 1}` : null,
       },
     };
+  }
+
+  /**
+   * Get search statistics (asset counts by type, visibility, etc.)
+   */
+  async getStatistics(auth: AuthDto) {
+    const images = await this.db
+      .selectFrom('asset')
+      .select((eb) => eb.fn.countAll().as('count'))
+      .where('asset.ownerId', '=', auth.user.id)
+      .where('asset.type', '=', AssetType.Image)
+      .where('asset.deletedAt', 'is', null)
+      .where('asset.visibility', '=', AssetVisibility.Timeline)
+      .executeTakeFirst();
+
+    const videos = await this.db
+      .selectFrom('asset')
+      .select((eb) => eb.fn.countAll().as('count'))
+      .where('asset.ownerId', '=', auth.user.id)
+      .where('asset.type', '=', AssetType.Video)
+      .where('asset.deletedAt', 'is', null)
+      .where('asset.visibility', '=', AssetVisibility.Timeline)
+      .executeTakeFirst();
+
+    return {
+      images: Number(images?.count ?? 0),
+      videos: Number(videos?.count ?? 0),
+      total: Number(images?.count ?? 0) + Number(videos?.count ?? 0),
+    };
+  }
+
+  /**
+   * Get random assets.
+   */
+  async getRandom(auth: AuthDto, dto: { count?: number }) {
+    const count = dto.count ?? 1;
+
+    const assets = await this.db
+      .selectFrom('asset')
+      .selectAll()
+      .where('asset.ownerId', '=', auth.user.id)
+      .where('asset.deletedAt', 'is', null)
+      .where('asset.visibility', '=', AssetVisibility.Timeline)
+      .orderBy(this.db.fn('random'))
+      .limit(count)
+      .execute();
+
+    return assets.map((a: any) => mapAsset(a, { auth }));
+  }
+
+  /**
+   * Find large assets by file size.
+   */
+  async getLargeAssets(auth: AuthDto, dto: { minSize?: number; page?: number; size?: number }) {
+    const page = dto.page ?? 1;
+    const size = dto.size ?? 250;
+    const offset = (page - 1) * size;
+    const minSize = dto.minSize ?? 0;
+
+    const assets = await this.db
+      .selectFrom('asset')
+      .innerJoin('asset_exif', 'asset_exif.assetId', 'asset.id')
+      .selectAll('asset')
+      .select('asset_exif.fileSizeInByte')
+      .where('asset.ownerId', '=', auth.user.id)
+      .where('asset.deletedAt', 'is', null)
+      .where('asset_exif.fileSizeInByte', '>', minSize)
+      .orderBy('asset_exif.fileSizeInByte', 'desc')
+      .limit(size)
+      .offset(offset)
+      .execute();
+
+    return assets.map((a: any) => mapAsset(a, { auth }));
+  }
+
+  /**
+   * Get search suggestions (cities, countries, makes, models, etc.)
+   */
+  async getSuggestions(auth: AuthDto, dto: { type: string; query?: string }) {
+    const { type, query: searchQuery } = dto;
+
+    switch (type) {
+      case 'city': {
+        let q = this.db
+          .selectFrom('asset_exif')
+          .innerJoin('asset', 'asset.id', 'asset_exif.assetId')
+          .select('asset_exif.city')
+          .distinct()
+          .where('asset.ownerId', '=', auth.user.id)
+          .where('asset_exif.city', 'is not', null);
+
+        if (searchQuery) {
+          q = q.where('asset_exif.city', 'like', `%${searchQuery}%`);
+        }
+
+        const rows = await q.limit(20).execute();
+        return rows.map((r) => r.city).filter(Boolean);
+      }
+
+      case 'country': {
+        let q = this.db
+          .selectFrom('asset_exif')
+          .innerJoin('asset', 'asset.id', 'asset_exif.assetId')
+          .select('asset_exif.country')
+          .distinct()
+          .where('asset.ownerId', '=', auth.user.id)
+          .where('asset_exif.country', 'is not', null);
+
+        if (searchQuery) {
+          q = q.where('asset_exif.country', 'like', `%${searchQuery}%`);
+        }
+
+        const rows = await q.limit(20).execute();
+        return rows.map((r) => r.country).filter(Boolean);
+      }
+
+      case 'camera-make': {
+        let q = this.db
+          .selectFrom('asset_exif')
+          .innerJoin('asset', 'asset.id', 'asset_exif.assetId')
+          .select('asset_exif.make')
+          .distinct()
+          .where('asset.ownerId', '=', auth.user.id)
+          .where('asset_exif.make', 'is not', null);
+
+        if (searchQuery) {
+          q = q.where('asset_exif.make', 'like', `%${searchQuery}%`);
+        }
+
+        const rows = await q.limit(20).execute();
+        return rows.map((r) => r.make).filter(Boolean);
+      }
+
+      case 'camera-model': {
+        let q = this.db
+          .selectFrom('asset_exif')
+          .innerJoin('asset', 'asset.id', 'asset_exif.assetId')
+          .select('asset_exif.model')
+          .distinct()
+          .where('asset.ownerId', '=', auth.user.id)
+          .where('asset_exif.model', 'is not', null);
+
+        if (searchQuery) {
+          q = q.where('asset_exif.model', 'like', `%${searchQuery}%`);
+        }
+
+        const rows = await q.limit(20).execute();
+        return rows.map((r) => r.model).filter(Boolean);
+      }
+
+      default:
+        return [];
+    }
   }
 }

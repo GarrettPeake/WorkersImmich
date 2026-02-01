@@ -1,9 +1,14 @@
-import { Injectable } from '@nestjs/common';
-import { Kysely } from 'kysely';
-import { InjectKysely } from 'nestjs-kysely';
+/**
+ * Download repository — Workers/D1-compatible version.
+ *
+ * Provides queries for fetching asset metadata needed by the download service.
+ * Uses Kysely with D1 dialect. No NestJS decorators, no PostgreSQL-specific features.
+ * Returns arrays instead of streams (D1 does not support streaming query results).
+ */
+
+import type { Kysely } from 'kysely';
 import { AssetVisibility } from 'src/enum';
-import { DB } from 'src/schema';
-import { anyUuid } from 'src/utils/database';
+import type { DB } from 'src/schema';
 
 const builder = (db: Kysely<DB>) =>
   db
@@ -12,29 +17,31 @@ const builder = (db: Kysely<DB>) =>
     .select(['asset.id', 'asset.livePhotoVideoId', 'asset_exif.fileSizeInByte as size'])
     .where('asset.deletedAt', 'is', null);
 
-@Injectable()
 export class DownloadRepository {
-  constructor(@InjectKysely() private db: Kysely<DB>) {}
+  constructor(private db: Kysely<DB>) {}
 
   downloadAssetIds(ids: string[]) {
-    return builder(this.db).where('asset.id', '=', anyUuid(ids)).stream();
+    return builder(this.db).where('asset.id', 'in', ids).execute();
   }
 
   downloadMotionAssetIds(ids: string[]) {
-    return builder(this.db).select(['asset.originalPath']).where('asset.id', '=', anyUuid(ids)).stream();
+    return builder(this.db)
+      .select(['asset.originalPath'])
+      .where('asset.id', 'in', ids)
+      .execute();
   }
 
   downloadAlbumId(albumId: string) {
     return builder(this.db)
       .innerJoin('album_asset', 'asset.id', 'album_asset.assetId')
       .where('album_asset.albumId', '=', albumId)
-      .stream();
+      .execute();
   }
 
   downloadUserId(userId: string) {
     return builder(this.db)
       .where('asset.ownerId', '=', userId)
       .where('asset.visibility', '!=', AssetVisibility.Hidden)
-      .stream();
+      .execute();
   }
 }

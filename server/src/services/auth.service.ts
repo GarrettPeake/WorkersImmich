@@ -1,35 +1,38 @@
-import { BadRequestException, ForbiddenException, Injectable, UnauthorizedException } from '@nestjs/common';
-import { isString } from 'class-validator';
-import { parse } from 'cookie';
-import { DateTime } from 'luxon';
-import { IncomingHttpHeaders } from 'node:http';
-import { join } from 'node:path';
+/**
+ * Auth service — Workers-compatible version.
+ *
+ * Handles login, logout, password changes, session validation, admin signup.
+ * No NestJS decorators, no node: imports.
+ */
+
+import { parse as parseCookies } from 'cookie';
 import { LOGIN_URL, MOBILE_REDIRECT, SALT_ROUNDS } from 'src/constants';
-import { StorageCore } from 'src/cores/storage.core';
-import { AuthSharedLink, AuthUser, UserAdmin } from 'src/database';
-import {
+import type { AuthSharedLink, AuthUser, UserAdmin } from 'src/database';
+import type {
   AuthDto,
   AuthStatusResponseDto,
   ChangePasswordDto,
   LoginCredentialDto,
   LogoutResponseDto,
-  OAuthCallbackDto,
-  OAuthConfigDto,
-  PinCodeChangeDto,
-  PinCodeResetDto,
-  PinCodeSetupDto,
-  SessionUnlockDto,
   SignUpDto,
-  mapLoginResponse,
 } from 'src/dtos/auth.dto';
-import { UserAdminResponseDto, mapUserAdmin } from 'src/dtos/user.dto';
-import { AuthType, ImmichCookie, ImmichHeader, ImmichQuery, JobName, Permission, StorageFolder } from 'src/enum';
-import { OAuthProfile } from 'src/repositories/oauth.repository';
-import { BaseService } from 'src/services/base.service';
+import { mapLoginResponse } from 'src/dtos/auth.dto';
+import { mapUserAdmin, type UserAdminResponseDto } from 'src/dtos/user.dto';
+import {
+  AuthType,
+  ImmichCookie,
+  ImmichHeader,
+  ImmichQuery,
+  Permission,
+} from 'src/enum';
+import type { ServiceContext } from 'src/context';
 import { isGranted } from 'src/utils/access';
-import { HumanReadableSize } from 'src/utils/bytes';
-import { mimeTypes } from 'src/utils/mime-types';
 import { getUserAgentDetails } from 'src/utils/request';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
 export interface LoginDetails {
   isSecure: boolean;
   clientIp: string;
@@ -38,189 +41,305 @@ export interface LoginDetails {
   appVersion: string | null;
 }
 
-interface ClaimOptions<T> {
-  key: string;
-  default: T;
-  isValid: (value: unknown) => boolean;
-}
-
 export type ValidateRequest = {
-  headers: IncomingHttpHeaders;
+  headers: Headers;
   queryParams: Record<string, string>;
   metadata: {
     sharedLinkRoute: boolean;
     adminRoute: boolean;
-    /** `false` explicitly means no permission is required, which otherwise defaults to `all` */
     permission?: Permission | false;
     uri: string;
   };
 };
 
-@Injectable()
-export class AuthService extends BaseService {
+// ---------------------------------------------------------------------------
+// Auth service class
+// ---------------------------------------------------------------------------
+
+export class AuthService {
+  private get db() {
+    return this.ctx.db;
+  }
+  private get crypto() {
+    return this.ctx.crypto;
+  }
+
+  constructor(private ctx: ServiceContext) {}
+
   async login(dto: LoginCredentialDto, details: LoginDetails) {
-    const config = await this.getConfig({ withCache: false });
-    if (!config.passwordLogin.enabled) {
-      throw new UnauthorizedException('Password login has been disabled');
+    const userRow = await this.db
+      .selectFrom('user')
+      .select([
+        'user.id',
+        'user.email',
+        'user.name',
+        'user.isAdmin',
+        'user.password',
+        'user.shouldChangePassword',
+        'user.profileImagePath',
+        'user.storageLabel',
+        'user.createdAt',
+        'user.updatedAt',
+        'user.deletedAt',
+        'user.oauthId',
+        'user.quotaSizeInBytes',
+        'user.quotaUsageInBytes',
+        'user.status',
+        'user.avatarColor',
+        'user.profileChangedAt',
+      ])
+      .where('user.email', '=', dto.email)
+      .where('user.deletedAt', 'is', null)
+      .executeTakeFirst();
+
+    if (!userRow) {
+      throw new AuthError(401, 'Incorrect email or password');
     }
 
-    let user = await this.userRepository.getByEmail(dto.email, { withPassword: true });
-    if (user) {
-      const isAuthenticated = this.validateSecret(dto.password, user.password);
-      if (!isAuthenticated) {
-        user = undefined;
-      }
+    const isAuthenticated = this.validateSecret(dto.password, userRow.password);
+    if (!isAuthenticated) {
+      throw new AuthError(401, 'Incorrect email or password');
     }
 
-    if (!user) {
-      this.logger.warn(`Failed login attempt for user ${dto.email} from ip address ${details.clientIp}`);
-      throw new UnauthorizedException('Incorrect email or password');
-    }
+    // Load metadata for login response
+    const metadata = await this.db
+      .selectFrom('user_metadata')
+      .select(['key', 'value'])
+      .where('userId', '=', userRow.id)
+      .execute();
 
+    const user = this.toUserAdmin(userRow, metadata);
     return this.createLoginResponse(user, details);
   }
 
   async logout(auth: AuthDto, authType: AuthType): Promise<LogoutResponseDto> {
     if (auth.session) {
-      await this.sessionRepository.delete(auth.session.id);
-      await this.eventRepository.emit('SessionDelete', { sessionId: auth.session.id });
+      await this.db
+        .deleteFrom('session')
+        .where('id', '=', auth.session.id)
+        .execute();
     }
 
     return {
       successful: true,
-      redirectUri: await this.getLogoutEndpoint(authType),
+      redirectUri: LOGIN_URL,
     };
   }
 
-  async changePassword(auth: AuthDto, dto: ChangePasswordDto): Promise<UserAdminResponseDto> {
+  async changePassword(
+    auth: AuthDto,
+    dto: ChangePasswordDto,
+  ): Promise<UserAdminResponseDto> {
     const { password, newPassword } = dto;
-    const user = await this.userRepository.getForChangePassword(auth.user.id);
-    const valid = this.validateSecret(password, user.password);
+
+    const userRow = await this.db
+      .selectFrom('user')
+      .select(['user.id', 'user.password'])
+      .where('user.id', '=', auth.user.id)
+      .executeTakeFirst();
+
+    if (!userRow) {
+      throw new AuthError(400, 'User not found');
+    }
+
+    const valid = this.validateSecret(password, userRow.password);
     if (!valid) {
-      throw new BadRequestException('Wrong password');
+      throw new AuthError(400, 'Wrong password');
     }
 
-    const hashedPassword = await this.cryptoRepository.hashBcrypt(newPassword, SALT_ROUNDS);
+    const hashedPassword = await this.crypto.hashBcrypt(
+      newPassword,
+      SALT_ROUNDS,
+    );
 
-    const updatedUser = await this.userRepository.update(user.id, { password: hashedPassword });
+    await this.db
+      .updateTable('user')
+      .set({ password: hashedPassword })
+      .where('id', '=', userRow.id)
+      .execute();
 
-    await this.eventRepository.emit('AuthChangePassword', {
-      userId: user.id,
-      currentSessionId: auth.session?.id,
-      invalidateSessions: dto.invalidateSessions,
-    });
+    // Invalidate other sessions if requested
+    if (dto.invalidateSessions) {
+      await this.db
+        .deleteFrom('session')
+        .where('userId', '=', userRow.id)
+        .$if(!!auth.session, (qb) =>
+          qb.where('id', '!=', auth.session!.id),
+        )
+        .execute();
+    }
 
-    return mapUserAdmin(updatedUser);
+    // Return updated user
+    const updatedRow = await this.db
+      .selectFrom('user')
+      .selectAll()
+      .where('id', '=', userRow.id)
+      .executeTakeFirstOrThrow();
+
+    const metadata = await this.db
+      .selectFrom('user_metadata')
+      .select(['key', 'value'])
+      .where('userId', '=', userRow.id)
+      .execute();
+
+    return mapUserAdmin(this.toUserAdmin(updatedRow, metadata));
   }
 
-  async setupPinCode(auth: AuthDto, { pinCode }: PinCodeSetupDto) {
-    const user = await this.userRepository.getForPinCode(auth.user.id);
-    if (!user) {
-      throw new UnauthorizedException();
-    }
-
-    if (user.pinCode) {
-      throw new BadRequestException('User already has a PIN code');
-    }
-
-    const hashed = await this.cryptoRepository.hashBcrypt(pinCode, SALT_ROUNDS);
-    await this.userRepository.update(auth.user.id, { pinCode: hashed });
-  }
-
-  async resetPinCode(auth: AuthDto, dto: PinCodeResetDto) {
-    const user = await this.userRepository.getForPinCode(auth.user.id);
-    this.validatePinCode(user, dto);
-
-    await this.userRepository.update(auth.user.id, { pinCode: null });
-    await this.sessionRepository.lockAll(auth.user.id);
-  }
-
-  async changePinCode(auth: AuthDto, dto: PinCodeChangeDto) {
-    const user = await this.userRepository.getForPinCode(auth.user.id);
-    this.validatePinCode(user, dto);
-
-    const hashed = await this.cryptoRepository.hashBcrypt(dto.newPinCode, SALT_ROUNDS);
-    await this.userRepository.update(auth.user.id, { pinCode: hashed });
-  }
-
-  private validatePinCode(
-    user: { pinCode: string | null; password: string | null },
-    dto: { pinCode?: string; password?: string },
-  ) {
-    if (!user.pinCode) {
-      throw new BadRequestException('User does not have a PIN code');
-    }
-
-    if (dto.password) {
-      if (!this.validateSecret(dto.password, user.password)) {
-        throw new BadRequestException('Wrong password');
-      }
-    } else if (dto.pinCode) {
-      if (!this.validateSecret(dto.pinCode, user.pinCode)) {
-        throw new BadRequestException('Wrong PIN code');
-      }
-    } else {
-      throw new BadRequestException('Either password or pinCode is required');
-    }
+  async validateToken(auth: AuthDto): Promise<{ authStatus: boolean }> {
+    return { authStatus: true };
   }
 
   async adminSignUp(dto: SignUpDto): Promise<UserAdminResponseDto> {
-    const { setup } = this.configRepository.getEnv();
-    if (!setup.allow) {
-      throw new BadRequestException('Admin setup is disabled');
+    // Check if admin already exists
+    const existingAdmin = await this.db
+      .selectFrom('user')
+      .select('id')
+      .where('isAdmin', '=', 1)
+      .where('deletedAt', 'is', null)
+      .executeTakeFirst();
+
+    if (existingAdmin) {
+      throw new AuthError(400, 'The server already has an admin');
     }
 
-    const adminUser = await this.userRepository.getAdmin();
-    if (adminUser) {
-      throw new BadRequestException('The server already has an admin');
-    }
+    const hashedPassword = await this.crypto.hashBcrypt(
+      dto.password,
+      SALT_ROUNDS,
+    );
 
-    const admin = await this.createUser({
-      isAdmin: true,
-      email: dto.email,
-      name: dto.name,
-      password: dto.password,
-      storageLabel: 'admin',
-    });
+    const id = this.crypto.randomUUID();
+    const now = new Date().toISOString();
 
-    return mapUserAdmin(admin);
+    await this.db
+      .insertInto('user')
+      .values({
+        id,
+        email: dto.email,
+        password: hashedPassword,
+        name: dto.name,
+        isAdmin: 1,
+        storageLabel: 'admin',
+        createdAt: now,
+        updatedAt: now,
+        shouldChangePassword: 0,
+        quotaUsageInBytes: 0,
+        profileImagePath: '',
+        oauthId: '',
+        status: 'active',
+        profileChangedAt: now,
+        updateId: this.crypto.randomUUID(),
+      })
+      .execute();
+
+    const userRow = await this.db
+      .selectFrom('user')
+      .selectAll()
+      .where('id', '=', id)
+      .executeTakeFirstOrThrow();
+
+    const metadata = await this.db
+      .selectFrom('user_metadata')
+      .select(['key', 'value'])
+      .where('userId', '=', id)
+      .execute();
+
+    return mapUserAdmin(this.toUserAdmin(userRow, metadata));
   }
 
-  async authenticate({ headers, queryParams, metadata }: ValidateRequest): Promise<AuthDto> {
+  async authenticate({
+    headers,
+    queryParams,
+    metadata,
+  }: ValidateRequest): Promise<AuthDto> {
     const authDto = await this.validate({ headers, queryParams });
     const { adminRoute, sharedLinkRoute, uri } = metadata;
     const requestedPermission = metadata.permission ?? Permission.All;
 
     if (!authDto.user.isAdmin && adminRoute) {
-      this.logger.warn(`Denied access to admin only route: ${uri}`);
-      throw new ForbiddenException('Forbidden');
+      throw new AuthError(403, 'Forbidden');
     }
 
     if (authDto.sharedLink && !sharedLinkRoute) {
-      this.logger.warn(`Denied access to non-shared route: ${uri}`);
-      throw new ForbiddenException('Forbidden');
+      throw new AuthError(403, 'Forbidden');
     }
 
     if (
       authDto.apiKey &&
       requestedPermission !== false &&
-      !isGranted({ requested: [requestedPermission], current: authDto.apiKey.permissions })
+      !isGranted({
+        requested: [requestedPermission as Permission],
+        current: authDto.apiKey.permissions,
+      })
     ) {
-      throw new ForbiddenException(`Missing required permission: ${requestedPermission}`);
+      throw new AuthError(
+        403,
+        `Missing required permission: ${requestedPermission}`,
+      );
     }
 
     return authDto;
   }
 
-  private async validate({ headers, queryParams }: Omit<ValidateRequest, 'metadata'>): Promise<AuthDto> {
-    const shareKey = (headers[ImmichHeader.SharedLinkKey] || queryParams[ImmichQuery.SharedLinkKey]) as string;
-    const shareSlug = (headers[ImmichHeader.SharedLinkSlug] || queryParams[ImmichQuery.SharedLinkSlug]) as string;
-    const session = (headers[ImmichHeader.UserToken] ||
-      headers[ImmichHeader.SessionToken] ||
+  async getAuthStatus(auth: AuthDto): Promise<AuthStatusResponseDto> {
+    const user = await this.db
+      .selectFrom('user')
+      .select(['pinCode', 'password'])
+      .where('id', '=', auth.user.id)
+      .executeTakeFirst();
+
+    if (!user) {
+      throw new AuthError(401, 'Unauthorized');
+    }
+
+    let expiresAt: string | undefined;
+    let pinExpiresAt: string | undefined;
+
+    if (auth.session) {
+      const session = await this.db
+        .selectFrom('session')
+        .select(['expiresAt', 'pinExpiresAt'])
+        .where('id', '=', auth.session.id)
+        .executeTakeFirst();
+
+      expiresAt = session?.expiresAt ?? undefined;
+      pinExpiresAt = session?.pinExpiresAt ?? undefined;
+    }
+
+    return {
+      pinCode: !!user.pinCode,
+      password: !!user.password,
+      isElevated: !!auth.session?.hasElevatedPermission,
+      expiresAt,
+      pinExpiresAt,
+    };
+  }
+
+  getMobileRedirect(url: string) {
+    return `${MOBILE_REDIRECT}?${url.split('?')[1] || ''}`;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private methods
+  // ---------------------------------------------------------------------------
+
+  private async validate({
+    headers,
+    queryParams,
+  }: Omit<ValidateRequest, 'metadata'>): Promise<AuthDto> {
+    const shareKey =
+      headers.get(ImmichHeader.SharedLinkKey) ||
+      queryParams[ImmichQuery.SharedLinkKey];
+    const shareSlug =
+      headers.get(ImmichHeader.SharedLinkSlug) ||
+      queryParams[ImmichQuery.SharedLinkSlug];
+    const session =
+      headers.get(ImmichHeader.UserToken) ||
+      headers.get(ImmichHeader.SessionToken) ||
       queryParams[ImmichQuery.SessionKey] ||
       this.getBearerToken(headers) ||
-      this.getCookieToken(headers)) as string;
-    const apiKey = (headers[ImmichHeader.ApiKey] || queryParams[ImmichQuery.ApiKey]) as string;
+      this.getCookieToken(headers);
+    const apiKey =
+      headers.get(ImmichHeader.ApiKey) || queryParams[ImmichQuery.ApiKey];
 
     if (shareKey) {
       return this.validateSharedLinkKey(shareKey);
@@ -238,353 +357,347 @@ export class AuthService extends BaseService {
       return this.validateApiKey(apiKey);
     }
 
-    throw new UnauthorizedException('Authentication required');
+    throw new AuthError(401, 'Authentication required');
   }
 
-  getMobileRedirect(url: string) {
-    return `${MOBILE_REDIRECT}?${url.split('?')[1] || ''}`;
-  }
-
-  async authorize(dto: OAuthConfigDto) {
-    const { oauth } = await this.getConfig({ withCache: false });
-
-    if (!oauth.enabled) {
-      throw new BadRequestException('OAuth is not enabled');
+  private getBearerToken(headers: Headers): string | null {
+    const [type, token] = (headers.get('authorization') || '').split(' ');
+    if (type?.toLowerCase() === 'bearer') {
+      return token || null;
     }
-
-    return await this.oauthRepository.authorize(
-      oauth,
-      this.resolveRedirectUri(oauth, dto.redirectUri),
-      dto.state,
-      dto.codeChallenge,
-    );
-  }
-
-  async callback(dto: OAuthCallbackDto, headers: IncomingHttpHeaders, loginDetails: LoginDetails) {
-    const expectedState = dto.state ?? this.getCookieOauthState(headers);
-    if (!expectedState?.length) {
-      throw new BadRequestException('OAuth state is missing');
-    }
-
-    const codeVerifier = dto.codeVerifier ?? this.getCookieCodeVerifier(headers);
-    if (!codeVerifier?.length) {
-      throw new BadRequestException('OAuth code verifier is missing');
-    }
-
-    const { oauth } = await this.getConfig({ withCache: false });
-    const url = this.resolveRedirectUri(oauth, dto.url);
-    const profile = await this.oauthRepository.getProfile(oauth, url, expectedState, codeVerifier);
-    const { autoRegister, defaultStorageQuota, storageLabelClaim, storageQuotaClaim, roleClaim } = oauth;
-    this.logger.debug(`Logging in with OAuth: ${JSON.stringify(profile)}`);
-    let user: UserAdmin | undefined = await this.userRepository.getByOAuthId(profile.sub);
-
-    // link by email
-    if (!user && profile.email) {
-      const emailUser = await this.userRepository.getByEmail(profile.email);
-      if (emailUser) {
-        if (emailUser.oauthId) {
-          throw new BadRequestException('User already exists, but is linked to another account.');
-        }
-        user = await this.userRepository.update(emailUser.id, { oauthId: profile.sub });
-      }
-    }
-
-    // register new user
-    if (!user) {
-      if (!autoRegister) {
-        this.logger.warn(
-          `Unable to register ${profile.sub}/${profile.email || '(no email)'}. To enable set OAuth Auto Register to true in admin settings.`,
-        );
-        throw new BadRequestException(`User does not exist and auto registering is disabled.`);
-      }
-
-      if (!profile.email) {
-        throw new BadRequestException('OAuth profile does not have an email address');
-      }
-
-      this.logger.log(`Registering new user: ${profile.sub}/${profile.email}`);
-
-      const storageLabel = this.getClaim(profile, {
-        key: storageLabelClaim,
-        default: '',
-        isValid: isString,
-      });
-      const storageQuota = this.getClaim(profile, {
-        key: storageQuotaClaim,
-        default: defaultStorageQuota,
-        isValid: (value: unknown) => Number(value) >= 0,
-      });
-      const role = this.getClaim<'admin' | 'user'>(profile, {
-        key: roleClaim,
-        default: 'user',
-        isValid: (value: unknown) => isString(value) && ['admin', 'user'].includes(value),
-      });
-
-      const userName = profile.name ?? `${profile.given_name || ''} ${profile.family_name || ''}`;
-      user = await this.createUser({
-        name: userName,
-        email: profile.email,
-        oauthId: profile.sub,
-        quotaSizeInBytes: storageQuota === null ? null : storageQuota * HumanReadableSize.GiB,
-        storageLabel: storageLabel || null,
-        isAdmin: role === 'admin',
-      });
-    }
-
-    if (!user.profileImagePath && profile.picture) {
-      await this.syncProfilePicture(user, profile.picture);
-    }
-
-    return this.createLoginResponse(user, loginDetails);
-  }
-
-  private async syncProfilePicture(user: UserAdmin, url: string) {
-    try {
-      const oldPath = user.profileImagePath;
-
-      const { contentType, data } = await this.oauthRepository.getProfilePicture(url);
-      const extensionWithDot = mimeTypes.toExtension(contentType || 'image/jpeg') ?? 'jpg';
-      const profileImagePath = join(
-        StorageCore.getFolderLocation(StorageFolder.Profile, user.id),
-        `${this.cryptoRepository.randomUUID()}${extensionWithDot}`,
-      );
-
-      this.storageCore.ensureFolders(profileImagePath);
-      await this.storageRepository.createFile(profileImagePath, Buffer.from(data));
-      await this.userRepository.update(user.id, { profileImagePath, profileChangedAt: new Date() });
-
-      if (oldPath) {
-        await this.jobRepository.queue({ name: JobName.FileDelete, data: { files: [oldPath] } });
-      }
-    } catch (error: Error | any) {
-      this.logger.warn(`Unable to sync oauth profile picture: ${error}\n${error?.stack}`);
-    }
-  }
-
-  async link(auth: AuthDto, dto: OAuthCallbackDto, headers: IncomingHttpHeaders): Promise<UserAdminResponseDto> {
-    const expectedState = dto.state ?? this.getCookieOauthState(headers);
-    if (!expectedState?.length) {
-      throw new BadRequestException('OAuth state is missing');
-    }
-
-    const codeVerifier = dto.codeVerifier ?? this.getCookieCodeVerifier(headers);
-    if (!codeVerifier?.length) {
-      throw new BadRequestException('OAuth code verifier is missing');
-    }
-
-    const { oauth } = await this.getConfig({ withCache: false });
-    const { sub: oauthId } = await this.oauthRepository.getProfile(oauth, dto.url, expectedState, codeVerifier);
-    const duplicate = await this.userRepository.getByOAuthId(oauthId);
-    if (duplicate && duplicate.id !== auth.user.id) {
-      this.logger.warn(`OAuth link account failed: sub is already linked to another user (${duplicate.email}).`);
-      throw new BadRequestException('This OAuth account has already been linked to another user.');
-    }
-
-    const user = await this.userRepository.update(auth.user.id, { oauthId });
-    return mapUserAdmin(user);
-  }
-
-  async unlink(auth: AuthDto): Promise<UserAdminResponseDto> {
-    const user = await this.userRepository.update(auth.user.id, { oauthId: '' });
-    return mapUserAdmin(user);
-  }
-
-  private async getLogoutEndpoint(authType: AuthType): Promise<string> {
-    if (authType !== AuthType.OAuth) {
-      return LOGIN_URL;
-    }
-
-    const config = await this.getConfig({ withCache: false });
-    if (!config.oauth.enabled) {
-      return LOGIN_URL;
-    }
-
-    return (await this.oauthRepository.getLogoutEndpoint(config.oauth)) || LOGIN_URL;
-  }
-
-  private getBearerToken(headers: IncomingHttpHeaders): string | null {
-    const [type, token] = (headers.authorization || '').split(' ');
-    if (type.toLowerCase() === 'bearer') {
-      return token;
-    }
-
     return null;
   }
 
-  private getCookieToken(headers: IncomingHttpHeaders): string | null {
-    const cookies = parse(headers.cookie || '');
+  private getCookieToken(headers: Headers): string | null {
+    const cookies = parseCookies(headers.get('cookie') || '');
     return cookies[ImmichCookie.AccessToken] || null;
   }
 
-  private getCookieOauthState(headers: IncomingHttpHeaders): string | null {
-    const cookies = parse(headers.cookie || '');
-    return cookies[ImmichCookie.OAuthState] || null;
-  }
-
-  private getCookieCodeVerifier(headers: IncomingHttpHeaders): string | null {
-    const cookies = parse(headers.cookie || '');
-    return cookies[ImmichCookie.OAuthCodeVerifier] || null;
-  }
-
-  async validateSharedLinkKey(key: string | string[]): Promise<AuthDto> {
+  private async validateSharedLinkKey(key: string | string[]): Promise<AuthDto> {
     key = Array.isArray(key) ? key[0] : key;
 
-    const bytes = Buffer.from(key, key.length === 100 ? 'hex' : 'base64url');
-    const sharedLink = await this.sharedLinkRepository.getByKey(bytes);
-    if (!this.isValidSharedLink(sharedLink)) {
-      throw new UnauthorizedException('Invalid share key');
+    // Convert key to bytes
+    let keyBytes: Uint8Array;
+    if (key.length === 100) {
+      // hex encoded
+      keyBytes = new Uint8Array(key.length / 2);
+      for (let i = 0; i < key.length; i += 2) {
+        keyBytes[i / 2] = Number.parseInt(key.slice(i, i + 2), 16);
+      }
+    } else {
+      // base64url encoded
+      const base64 = key.replace(/-/g, '+').replace(/_/g, '/');
+      const binaryString = atob(base64);
+      keyBytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        keyBytes[i] = binaryString.charCodeAt(i);
+      }
     }
 
-    return { user: sharedLink.user, sharedLink };
+    const sharedLink = await this.db
+      .selectFrom('shared_link')
+      .select([
+        'shared_link.id',
+        'shared_link.expiresAt',
+        'shared_link.userId',
+        'shared_link.showExif',
+        'shared_link.allowUpload',
+        'shared_link.allowDownload',
+        'shared_link.password',
+      ])
+      .where('shared_link.key', '=', keyBytes)
+      .executeTakeFirst();
+
+    if (!sharedLink || (sharedLink.expiresAt && new Date(sharedLink.expiresAt) <= new Date())) {
+      throw new AuthError(401, 'Invalid share key');
+    }
+
+    const user = await this.loadAuthUser(sharedLink.userId);
+    if (!user) {
+      throw new AuthError(401, 'Invalid share key');
+    }
+
+    return {
+      user,
+      sharedLink: {
+        id: sharedLink.id,
+        expiresAt: sharedLink.expiresAt,
+        userId: sharedLink.userId,
+        showExif: Boolean(sharedLink.showExif),
+        allowUpload: Boolean(sharedLink.allowUpload),
+        allowDownload: Boolean(sharedLink.allowDownload),
+        password: sharedLink.password,
+      },
+    };
   }
 
-  async validateSharedLinkSlug(slug: string | string[]): Promise<AuthDto> {
+  private async validateSharedLinkSlug(slug: string | string[]): Promise<AuthDto> {
     slug = Array.isArray(slug) ? slug[0] : slug;
 
-    const sharedLink = await this.sharedLinkRepository.getBySlug(slug);
-    if (!this.isValidSharedLink(sharedLink)) {
-      throw new UnauthorizedException('Invalid share slug');
+    const sharedLink = await this.db
+      .selectFrom('shared_link')
+      .select([
+        'shared_link.id',
+        'shared_link.expiresAt',
+        'shared_link.userId',
+        'shared_link.showExif',
+        'shared_link.allowUpload',
+        'shared_link.allowDownload',
+        'shared_link.password',
+      ])
+      .where('shared_link.slug', '=', slug)
+      .executeTakeFirst();
+
+    if (!sharedLink || (sharedLink.expiresAt && new Date(sharedLink.expiresAt) <= new Date())) {
+      throw new AuthError(401, 'Invalid share slug');
     }
 
-    return { user: sharedLink.user, sharedLink };
-  }
+    const user = await this.loadAuthUser(sharedLink.userId);
+    if (!user) {
+      throw new AuthError(401, 'Invalid share slug');
+    }
 
-  private isValidSharedLink(
-    sharedLink?: AuthSharedLink & { user: AuthUser | null },
-  ): sharedLink is AuthSharedLink & { user: AuthUser } {
-    return !!sharedLink?.user && (!sharedLink.expiresAt || new Date(sharedLink.expiresAt) > new Date());
+    return {
+      user,
+      sharedLink: {
+        id: sharedLink.id,
+        expiresAt: sharedLink.expiresAt,
+        userId: sharedLink.userId,
+        showExif: Boolean(sharedLink.showExif),
+        allowUpload: Boolean(sharedLink.allowUpload),
+        allowDownload: Boolean(sharedLink.allowDownload),
+        password: sharedLink.password,
+      },
+    };
   }
 
   private async validateApiKey(key: string): Promise<AuthDto> {
-    const hashedKey = this.cryptoRepository.hashSha256(key);
-    const apiKey = await this.apiKeyRepository.getKey(hashedKey);
-    if (apiKey?.user) {
-      return {
-        user: apiKey.user,
-        apiKey,
-      };
+    const hashedKey = await this.crypto.hashSha256(key);
+
+    const apiKey = await this.db
+      .selectFrom('api_key')
+      .select(['api_key.id', 'api_key.permissions', 'api_key.userId'])
+      .where('api_key.key', '=', hashedKey)
+      .executeTakeFirst();
+
+    if (!apiKey) {
+      throw new AuthError(401, 'Invalid API key');
     }
 
-    throw new UnauthorizedException('Invalid API key');
+    const user = await this.loadAuthUser(apiKey.userId);
+    if (!user) {
+      throw new AuthError(401, 'Invalid API key');
+    }
+
+    let permissions: Permission[];
+    if (typeof apiKey.permissions === 'string') {
+      try {
+        permissions = JSON.parse(apiKey.permissions) as Permission[];
+      } catch {
+        permissions = [];
+      }
+    } else {
+      permissions = apiKey.permissions as unknown as Permission[];
+    }
+
+    return {
+      user,
+      apiKey: {
+        id: apiKey.id,
+        permissions,
+      },
+    };
   }
 
-  private validateSecret(inputSecret: string, existingHash?: string | null): boolean {
+  private validateSecret(
+    inputSecret: string,
+    existingHash?: string | null,
+  ): boolean {
     if (!existingHash) {
       return false;
     }
-
-    return this.cryptoRepository.compareBcrypt(inputSecret, existingHash);
+    return this.crypto.compareBcrypt(inputSecret, existingHash);
   }
 
-  private async validateSession(tokenValue: string, headers: IncomingHttpHeaders): Promise<AuthDto> {
-    const hashedToken = this.cryptoRepository.hashSha256(tokenValue);
-    const session = await this.sessionRepository.getByToken(hashedToken);
-    if (session?.user) {
-      const { appVersion, deviceOS, deviceType } = getUserAgentDetails(headers);
-      const now = DateTime.now();
-      const updatedAt = DateTime.fromJSDate(session.updatedAt);
-      const diff = now.diff(updatedAt, ['hours']);
-      if (diff.hours > 1 || appVersion != session.appVersion) {
-        await this.sessionRepository.update(session.id, {
-          id: session.id,
-          updatedAt: new Date(),
+  private async validateSession(
+    tokenValue: string,
+    headers: Headers,
+  ): Promise<AuthDto> {
+    const hashedToken = await this.crypto.hashSha256(tokenValue);
+
+    const session = await this.db
+      .selectFrom('session')
+      .select([
+        'session.id',
+        'session.updatedAt',
+        'session.pinExpiresAt',
+        'session.appVersion',
+        'session.userId',
+      ])
+      .where('session.token', '=', hashedToken)
+      .where((eb) =>
+        eb.or([
+          eb('session.expiresAt', 'is', null),
+          eb('session.expiresAt', '>', new Date().toISOString()),
+        ]),
+      )
+      .executeTakeFirst();
+
+    if (!session) {
+      throw new AuthError(401, 'Invalid user token');
+    }
+
+    const user = await this.loadAuthUser(session.userId);
+    if (!user) {
+      throw new AuthError(401, 'Invalid user token');
+    }
+
+    // Update session metadata if stale
+    const { appVersion, deviceOS, deviceType } = getUserAgentDetails(headers);
+    const now = Date.now();
+    const updatedAt = new Date(session.updatedAt).getTime();
+    const hourMs = 3_600_000;
+
+    if (now - updatedAt > hourMs || appVersion !== session.appVersion) {
+      this.db
+        .updateTable('session')
+        .set({
+          updatedAt: new Date().toISOString(),
           appVersion,
           deviceOS,
           deviceType,
-        });
+        })
+        .where('session.id', '=', session.id)
+        .execute()
+        .catch(() => {});
+    }
+
+    // Pin/elevated permission check
+    let hasElevatedPermission = false;
+    if (session.pinExpiresAt) {
+      const pinExpiresAt = new Date(session.pinExpiresAt).getTime();
+      hasElevatedPermission = pinExpiresAt > now;
+
+      if (hasElevatedPermission && now + 5 * 60_000 > pinExpiresAt) {
+        const newExpiry = new Date(now + 5 * 60_000).toISOString();
+        this.db
+          .updateTable('session')
+          .set({ pinExpiresAt: newExpiry })
+          .where('session.id', '=', session.id)
+          .execute()
+          .catch(() => {});
       }
-
-      // Pin check
-      let hasElevatedPermission = false;
-
-      if (session.pinExpiresAt) {
-        const pinExpiresAt = DateTime.fromJSDate(session.pinExpiresAt);
-        hasElevatedPermission = pinExpiresAt > now;
-
-        if (hasElevatedPermission && now.plus({ minutes: 5 }) > pinExpiresAt) {
-          await this.sessionRepository.update(session.id, {
-            pinExpiresAt: DateTime.now().plus({ minutes: 5 }).toJSDate(),
-          });
-        }
-      }
-
-      return {
-        user: session.user,
-        session: {
-          id: session.id,
-          hasElevatedPermission,
-        },
-      };
     }
 
-    throw new UnauthorizedException('Invalid user token');
+    return {
+      user,
+      session: {
+        id: session.id,
+        hasElevatedPermission,
+      },
+    };
   }
 
-  async unlockSession(auth: AuthDto, dto: SessionUnlockDto): Promise<void> {
-    if (!auth.session) {
-      throw new BadRequestException('This endpoint can only be used with a session token');
+  private async loadAuthUser(userId: string): Promise<AuthUser | null> {
+    const row = await this.db
+      .selectFrom('user')
+      .select([
+        'user.id',
+        'user.name',
+        'user.email',
+        'user.isAdmin',
+        'user.quotaUsageInBytes',
+        'user.quotaSizeInBytes',
+      ])
+      .where('user.id', '=', userId)
+      .where('user.deletedAt', 'is', null)
+      .executeTakeFirst();
+
+    if (!row) {
+      return null;
     }
 
-    const user = await this.userRepository.getForPinCode(auth.user.id);
-    this.validatePinCode(user, { pinCode: dto.pinCode });
-
-    await this.sessionRepository.update(auth.session.id, {
-      pinExpiresAt: DateTime.now().plus({ minutes: 15 }).toJSDate(),
-    });
+    return {
+      id: row.id,
+      isAdmin: Boolean(row.isAdmin),
+      name: row.name,
+      email: row.email,
+      quotaUsageInBytes: row.quotaUsageInBytes ?? 0,
+      quotaSizeInBytes: row.quotaSizeInBytes,
+    };
   }
 
-  async lockSession(auth: AuthDto): Promise<void> {
-    if (!auth.session) {
-      throw new BadRequestException('This endpoint can only be used with a session token');
-    }
+  private async createLoginResponse(
+    user: UserAdmin,
+    loginDetails: LoginDetails,
+  ) {
+    const token = this.crypto.randomBytesAsText(32);
+    const tokenHashed = await this.crypto.hashSha256(token);
 
-    await this.sessionRepository.update(auth.session.id, { pinExpiresAt: null });
-  }
-
-  private async createLoginResponse(user: UserAdmin, loginDetails: LoginDetails) {
-    const token = this.cryptoRepository.randomBytesAsText(32);
-    const tokenHashed = this.cryptoRepository.hashSha256(token);
-
-    await this.sessionRepository.create({
-      token: tokenHashed,
-      deviceOS: loginDetails.deviceOS,
-      deviceType: loginDetails.deviceType,
-      appVersion: loginDetails.appVersion,
-      userId: user.id,
-    });
+    await this.db
+      .insertInto('session')
+      .values({
+        id: this.crypto.randomUUID(),
+        token: tokenHashed,
+        deviceOS: loginDetails.deviceOS,
+        deviceType: loginDetails.deviceType,
+        appVersion: loginDetails.appVersion,
+        userId: user.id,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        updateId: this.crypto.randomUUID(),
+      })
+      .execute();
 
     return mapLoginResponse(user, token);
   }
 
-  private getClaim<T>(profile: OAuthProfile, options: ClaimOptions<T>): T {
-    const value = profile[options.key as keyof OAuthProfile];
-    return options.isValid(value) ? (value as T) : options.default;
-  }
-
-  private resolveRedirectUri(
-    { mobileRedirectUri, mobileOverrideEnabled }: { mobileRedirectUri: string; mobileOverrideEnabled: boolean },
-    url: string,
-  ) {
-    if (mobileOverrideEnabled && mobileRedirectUri) {
-      return url.replace(/app\.immich:\/+oauth-callback/, mobileRedirectUri);
-    }
-    return url;
-  }
-
-  async getAuthStatus(auth: AuthDto): Promise<AuthStatusResponseDto> {
-    const user = await this.userRepository.getForPinCode(auth.user.id);
-    if (!user) {
-      throw new UnauthorizedException();
-    }
-
-    const session = auth.session ? await this.sessionRepository.get(auth.session.id) : undefined;
+  /**
+   * Convert a raw DB row + metadata rows into a UserAdmin domain object.
+   */
+  private toUserAdmin(
+    row: Record<string, unknown>,
+    metadataRows: Array<{ key: string; value: string }>,
+  ): UserAdmin {
+    const metadata = metadataRows.map((m) => ({
+      key: m.key,
+      value: typeof m.value === 'string' ? JSON.parse(m.value) : m.value,
+    }));
 
     return {
-      pinCode: !!user.pinCode,
-      password: !!user.password,
-      isElevated: !!auth.session?.hasElevatedPermission,
-      expiresAt: session?.expiresAt?.toISOString(),
-      pinExpiresAt: session?.pinExpiresAt?.toISOString(),
+      id: row.id as string,
+      email: row.email as string,
+      name: (row.name as string) || '',
+      avatarColor: (row.avatarColor as any) || null,
+      profileImagePath: (row.profileImagePath as string) || '',
+      profileChangedAt: (row.profileChangedAt as string) || '',
+      storageLabel: (row.storageLabel as string) || null,
+      shouldChangePassword: Boolean(row.shouldChangePassword),
+      isAdmin: Boolean(row.isAdmin),
+      createdAt: (row.createdAt as string) || '',
+      updatedAt: (row.updatedAt as string) || '',
+      deletedAt: (row.deletedAt as string) || null,
+      oauthId: (row.oauthId as string) || '',
+      quotaSizeInBytes: (row.quotaSizeInBytes as number) ?? null,
+      quotaUsageInBytes: (row.quotaUsageInBytes as number) ?? 0,
+      status: (row.status as string) || 'active',
+      metadata,
+      password: (row.password as string) || null,
+      pinCode: (row.pinCode as string) || null,
     };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Error class for auth errors (maps to HTTP status codes)
+// ---------------------------------------------------------------------------
+
+export class AuthError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'AuthError';
   }
 }

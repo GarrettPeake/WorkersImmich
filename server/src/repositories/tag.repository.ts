@@ -1,184 +1,243 @@
-import { Injectable } from '@nestjs/common';
-import { Insertable, Kysely, sql, Updateable } from 'kysely';
-import { InjectKysely } from 'nestjs-kysely';
-import { columns } from 'src/database';
-import { Chunked, ChunkedSet, DummyValue, GenerateSql } from 'src/decorators';
-import { LoggingRepository } from 'src/repositories/logging.repository';
-import { DB } from 'src/schema';
-import { TagAssetTable } from 'src/schema/tables/tag-asset.table';
-import { TagTable } from 'src/schema/tables/tag.table';
+/**
+ * Tag repository -- Workers/D1-compatible version.
+ *
+ * No @Injectable, @InjectKysely, @GenerateSql, @Chunked decorators.
+ * No LoggingRepository dependency.
+ * No ::uuid casts. Plain Kysely with D1 dialect.
+ */
 
-@Injectable()
+import type { Insertable, Kysely, Updateable } from 'kysely';
+import { sql } from 'kysely';
+import type { DB, TagTable, TagAssetTable } from 'src/schema';
+
+const CHUNK_SIZE = 500;
+
 export class TagRepository {
-  constructor(
-    @InjectKysely() private db: Kysely<DB>,
-    private logger: LoggingRepository,
-  ) {
-    this.logger.setContext(TagRepository.name);
-  }
+  constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID] })
   get(id: string) {
-    return this.db.selectFrom('tag').select(columns.tag).where('id', '=', id).executeTakeFirst();
+    return this.db
+      .selectFrom('tag')
+      .selectAll()
+      .where('id', '=', id)
+      .executeTakeFirst();
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.STRING] })
   getByValue(userId: string, value: string) {
     return this.db
       .selectFrom('tag')
-      .select(columns.tag)
+      .selectAll()
       .where('userId', '=', userId)
       .where('value', '=', value)
       .executeTakeFirst();
   }
 
-  @GenerateSql({ params: [{ userId: DummyValue.UUID, value: DummyValue.STRING, parentId: DummyValue.UUID }] })
   async upsertValue({ userId, value, parentId: _parentId }: { userId: string; value: string; parentId?: string }) {
     const parentId = _parentId ?? null;
     return this.db.transaction().execute(async (tx) => {
-      const tag = await this.db
-        .insertInto('tag')
-        .values({ userId, value, parentId })
-        .onConflict((oc) => oc.columns(['userId', 'value']).doUpdateSet({ parentId }))
-        .returning(columns.tag)
-        .executeTakeFirstOrThrow();
+      // Insert or update tag
+      const existing = await tx
+        .selectFrom('tag')
+        .selectAll()
+        .where('userId', '=', userId)
+        .where('value', '=', value)
+        .executeTakeFirst();
 
-      // update closure table
-      await tx
-        .insertInto('tag_closure')
-        .values({ id_ancestor: tag.id, id_descendant: tag.id })
-        .onConflict((oc) => oc.doNothing())
-        .execute();
+      let tag: any;
+      if (existing) {
+        await tx
+          .updateTable('tag')
+          .set({ parentId })
+          .where('id', '=', existing.id)
+          .execute();
+        tag = { ...existing, parentId };
+      } else {
+        await tx
+          .insertInto('tag')
+          .values({ userId, value, parentId })
+          .execute();
+        tag = await tx
+          .selectFrom('tag')
+          .selectAll()
+          .where('userId', '=', userId)
+          .where('value', '=', value)
+          .executeTakeFirstOrThrow();
+      }
 
-      if (parentId) {
+      // Update closure table -- self-reference
+      const selfExists = await tx
+        .selectFrom('tag_closure')
+        .selectAll()
+        .where('id_ancestor', '=', tag.id)
+        .where('id_descendant', '=', tag.id)
+        .executeTakeFirst();
+
+      if (!selfExists) {
         await tx
           .insertInto('tag_closure')
-          .columns(['id_ancestor', 'id_descendant'])
-          .expression(
-            this.db
-              .selectFrom('tag_closure')
-              .select(['id_ancestor', sql.raw<string>(`'${tag.id}'`).as('id_descendant')])
-              .where('id_descendant', '=', parentId),
-          )
-          .onConflict((oc) => oc.doNothing())
+          .values({ id_ancestor: tag.id, id_descendant: tag.id })
           .execute();
+      }
+
+      if (parentId) {
+        // Add ancestor closures
+        const ancestors = await tx
+          .selectFrom('tag_closure')
+          .select('id_ancestor')
+          .where('id_descendant', '=', parentId)
+          .execute();
+
+        for (const ancestor of ancestors) {
+          const alreadyExists = await tx
+            .selectFrom('tag_closure')
+            .selectAll()
+            .where('id_ancestor', '=', ancestor.id_ancestor)
+            .where('id_descendant', '=', tag.id)
+            .executeTakeFirst();
+
+          if (!alreadyExists) {
+            await tx
+              .insertInto('tag_closure')
+              .values({ id_ancestor: ancestor.id_ancestor, id_descendant: tag.id })
+              .execute();
+          }
+        }
       }
 
       return tag;
     });
   }
 
-  @GenerateSql({ params: [DummyValue.UUID] })
+  /**
+   * Upsert multiple tags from an array of tag value strings.
+   * Creates parent tags automatically for hierarchical values like "parent/child".
+   */
+  async upsertTags({ userId, tags }: { userId: string; tags: string[] }) {
+    const results: any[] = [];
+    for (const tagValue of tags) {
+      const parts = tagValue.split('/');
+      let parentId: string | undefined;
+
+      for (let i = 0; i < parts.length; i++) {
+        const value = parts.slice(0, i + 1).join('/');
+        const tag = await this.upsertValue({ userId, value, parentId });
+        parentId = tag.id;
+
+        if (i === parts.length - 1) {
+          results.push(tag);
+        }
+      }
+    }
+    return results;
+  }
+
   getAll(userId: string) {
-    return this.db.selectFrom('tag').select(columns.tag).where('userId', '=', userId).orderBy('value').execute();
+    return this.db
+      .selectFrom('tag')
+      .selectAll()
+      .where('userId', '=', userId)
+      .orderBy('value')
+      .execute();
   }
 
-  @GenerateSql({ params: [{ userId: DummyValue.UUID, color: DummyValue.STRING, value: DummyValue.STRING }] })
-  create(tag: Insertable<TagTable>) {
-    return this.db.insertInto('tag').values(tag).returningAll().executeTakeFirstOrThrow();
+  async create(tag: Insertable<TagTable>) {
+    await this.db.insertInto('tag').values(tag).execute();
+    return this.db
+      .selectFrom('tag')
+      .selectAll()
+      .where('userId', '=', tag.userId)
+      .where('value', '=', tag.value)
+      .executeTakeFirstOrThrow();
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, { color: DummyValue.STRING }] })
-  update(id: string, dto: Updateable<TagTable>) {
-    return this.db.updateTable('tag').set(dto).where('id', '=', id).returningAll().executeTakeFirstOrThrow();
+  async update(id: string, dto: Updateable<TagTable>) {
+    await this.db.updateTable('tag').set(dto).where('id', '=', id).execute();
+    return this.db
+      .selectFrom('tag')
+      .selectAll()
+      .where('id', '=', id)
+      .executeTakeFirstOrThrow();
   }
 
-  @GenerateSql({ params: [DummyValue.UUID] })
   async delete(id: string) {
     await this.db.deleteFrom('tag').where('id', '=', id).execute();
   }
 
-  @ChunkedSet({ paramIndex: 1 })
-  @GenerateSql({ params: [DummyValue.UUID, [DummyValue.UUID]] })
   async getAssetIds(tagId: string, assetIds: string[]): Promise<Set<string>> {
     if (assetIds.length === 0) {
       return new Set();
     }
 
-    const results = await this.db
-      .selectFrom('tag_asset')
-      .select(['assetId as assetId'])
-      .where('tagId', '=', tagId)
-      .where('assetId', 'in', assetIds)
-      .execute();
+    const allResults: string[] = [];
+    for (let i = 0; i < assetIds.length; i += CHUNK_SIZE) {
+      const chunk = assetIds.slice(i, i + CHUNK_SIZE);
+      const results = await this.db
+        .selectFrom('tag_asset')
+        .select('assetId')
+        .where('tagId', '=', tagId)
+        .where('assetId', 'in', chunk)
+        .execute();
+      for (const r of results) {
+        allResults.push(r.assetId);
+      }
+    }
 
-    return new Set(results.map(({ assetId }) => assetId));
+    return new Set(allResults);
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, [DummyValue.UUID]] })
-  @Chunked({ paramIndex: 1 })
   async addAssetIds(tagId: string, assetIds: string[]): Promise<void> {
     if (assetIds.length === 0) {
       return;
     }
 
-    await this.db
-      .insertInto('tag_asset')
-      .values(assetIds.map((assetId) => ({ tagId, assetId })))
-      .execute();
+    for (let i = 0; i < assetIds.length; i += CHUNK_SIZE) {
+      const chunk = assetIds.slice(i, i + CHUNK_SIZE);
+      await this.db
+        .insertInto('tag_asset')
+        .values(chunk.map((assetId) => ({ tagId, assetId })))
+        .execute();
+    }
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, [DummyValue.UUID]] })
-  @Chunked({ paramIndex: 1 })
   async removeAssetIds(tagId: string, assetIds: string[]): Promise<void> {
     if (assetIds.length === 0) {
       return;
     }
 
-    await this.db.deleteFrom('tag_asset').where('tagId', '=', tagId).where('assetId', 'in', assetIds).execute();
-  }
-
-  @GenerateSql({ params: [[{ assetId: DummyValue.UUID, tagIds: DummyValue.UUID }]] })
-  @Chunked()
-  upsertAssetIds(items: Insertable<TagAssetTable>[]) {
-    if (items.length === 0) {
-      return Promise.resolve([]);
-    }
-
-    return this.db
-      .insertInto('tag_asset')
-      .values(items)
-      .onConflict((oc) => oc.doNothing())
-      .returningAll()
-      .execute();
-  }
-
-  @GenerateSql({ params: [DummyValue.UUID, [DummyValue.UUID]] })
-  @Chunked({ paramIndex: 1 })
-  replaceAssetTags(assetId: string, tagIds: string[]) {
-    return this.db.transaction().execute(async (tx) => {
-      await tx.deleteFrom('tag_asset').where('assetId', '=', assetId).execute();
-
-      if (tagIds.length === 0) {
-        return;
-      }
-
-      return tx
-        .insertInto('tag_asset')
-        .values(tagIds.map((tagId) => ({ tagId, assetId })))
-        .onConflict((oc) => oc.doNothing())
-        .returningAll()
+    for (let i = 0; i < assetIds.length; i += CHUNK_SIZE) {
+      const chunk = assetIds.slice(i, i + CHUNK_SIZE);
+      await this.db
+        .deleteFrom('tag_asset')
+        .where('tagId', '=', tagId)
+        .where('assetId', 'in', chunk)
         .execute();
-    });
+    }
   }
 
-  async deleteEmptyTags() {
-    const result = await this.db
-      .deleteFrom('tag')
-      .where(({ not, exists, selectFrom }) =>
-        not(
-          exists(
-            selectFrom('tag_closure')
-              .whereRef('tag.id', '=', 'tag_closure.id_ancestor')
-              .innerJoin('tag_asset', 'tag_closure.id_descendant', 'tag_asset.tagId'),
-          ),
-        ),
-      )
-      .executeTakeFirst();
-
-    const deletedRows = Number(result.numDeletedRows);
-    if (deletedRows > 0) {
-      this.logger.log(`Deleted ${deletedRows} empty tags`);
+  async upsertAssetIds(items: Insertable<TagAssetTable>[]) {
+    if (items.length === 0) {
+      return [];
     }
+
+    const results: any[] = [];
+    for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+      const chunk = items.slice(i, i + CHUNK_SIZE);
+      // SQLite: INSERT OR IGNORE for upsert on conflict do nothing
+      for (const item of chunk) {
+        const existing = await this.db
+          .selectFrom('tag_asset')
+          .selectAll()
+          .where('tagId', '=', item.tagId)
+          .where('assetId', '=', item.assetId)
+          .executeTakeFirst();
+
+        if (!existing) {
+          await this.db.insertInto('tag_asset').values(item).execute();
+          results.push(item);
+        }
+      }
+    }
+
+    return results;
   }
 }

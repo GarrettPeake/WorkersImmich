@@ -1,355 +1,448 @@
-import { Injectable } from '@nestjs/common';
-import { ExifDateTime, exiftool, WriteTags } from 'exiftool-vendored';
-import ffmpeg, { FfprobeData } from 'fluent-ffmpeg';
-import { Duration } from 'luxon';
-import fs from 'node:fs/promises';
-import { Writable } from 'node:stream';
-import sharp from 'sharp';
-import { ORIENTATION_TO_SHARP_ROTATION } from 'src/constants';
-import { Exif } from 'src/database';
-import { AssetEditActionItem } from 'src/dtos/editing.dto';
-import { Colorspace, LogLevel, RawExtractedFormat } from 'src/enum';
-import { LoggingRepository } from 'src/repositories/logging.repository';
-import {
-  DecodeToBufferOptions,
-  GenerateThumbhashOptions,
-  GenerateThumbnailOptions,
-  ImageDimensions,
-  ProbeOptions,
-  TranscodeCommand,
-  VideoInfo,
-} from 'src/types';
-import { handlePromiseError } from 'src/utils/misc';
-import { createAffineMatrix } from 'src/utils/transform';
+/**
+ * MediaRepository — Cloudflare Workers image processing.
+ *
+ * Replaces Sharp-based image processing with Cloudflare Images transforms.
+ * Replaces ExifTool with exifreader (pure JS EXIF parser).
+ * No sharp, exiftool-vendored, fluent-ffmpeg, or node: imports.
+ *
+ * Image transforms use Cloudflare Image Resizing via cf.image options on fetch().
+ * The Worker must be deployed on a zone with Image Resizing enabled.
+ *
+ * Generated variants (thumbnail, preview) are stored in R2 alongside the original.
+ * The original file is always preserved.
+ */
 
-const probe = (input: string, options: string[]): Promise<FfprobeData> =>
-  new Promise((resolve, reject) =>
-    ffmpeg.ffprobe(input, options, (error, data) => (error ? reject(error) : resolve(data))),
-  );
-sharp.concurrency(0);
-sharp.cache({ files: 0 });
+import ExifReader from 'exifreader';
+import { StorageCore } from 'src/cores/storage.core';
 
-type ProgressEvent = {
-  frames: number;
-  currentFps: number;
-  currentKbps: number;
-  targetSize: number;
-  timemark: string;
-  percent?: number;
-};
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
-export type ExtractResult = {
-  buffer: Buffer;
-  format: RawExtractedFormat;
-};
+export interface ImageTransformOptions {
+  width: number;
+  height: number;
+  fit?: 'scale-down' | 'contain' | 'cover' | 'crop' | 'pad';
+  format?: 'webp' | 'avif' | 'jpeg' | 'png';
+  quality?: number;
+}
 
-@Injectable()
+export interface ImageDimensions {
+  width: number;
+  height: number;
+}
+
+export interface ExifData {
+  make?: string;
+  model?: string;
+  exposureTime?: string;
+  fNumber?: number;
+  iso?: number;
+  focalLength?: number;
+  lensModel?: string;
+  dateTimeOriginal?: string;
+  modifyDate?: string;
+  latitude?: number;
+  longitude?: number;
+  city?: string;
+  state?: string;
+  country?: string;
+  description?: string;
+  orientation?: string;
+  exifImageWidth?: number;
+  exifImageHeight?: number;
+  fileSizeInByte?: number;
+  projectionType?: string;
+  profileDescription?: string;
+  colorspace?: string;
+  bitsPerSample?: number;
+  rating?: number;
+  timeZone?: string;
+  fps?: number;
+  livePhotoCID?: string;
+  autoStackId?: string;
+  tags?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Repository
+// ---------------------------------------------------------------------------
+
 export class MediaRepository {
-  constructor(private logger: LoggingRepository) {
-    this.logger.setContext(MediaRepository.name);
-  }
+  constructor(
+    private bucket: R2Bucket,
+    private imageResizingBaseUrl: string,
+  ) {}
+
+  // -------------------------------------------------------------------------
+  // Thumbnail generation
+  // -------------------------------------------------------------------------
 
   /**
+   * Generate a thumbnail using Cloudflare Image Resizing.
+   * Stores the result in R2 for caching.
    *
-   * @param input file path to the input image
-   * @returns ExtractResult if succeeded, or null if failed
+   * The worker fetches a subrequest to its own zone with `cf.image` options,
+   * which invokes Cloudflare Image Resizing on the fly.
+   *
+   * @returns The R2 key where the thumbnail is stored.
    */
-  async extract(input: string): Promise<ExtractResult | null> {
-    try {
-      const buffer = await exiftool.extractBinaryTagToBuffer('JpgFromRaw2', input);
-      return { buffer, format: RawExtractedFormat.Jpeg };
-    } catch (error: any) {
-      this.logger.debug(`Could not extract JpgFromRaw2 buffer from image, trying JPEG from RAW next: ${error}`);
+  async generateThumbnail(
+    userId: string,
+    assetId: string,
+    originalKey: string,
+    options: { width: number; height: number; format?: string; quality?: number },
+  ): Promise<string> {
+    const thumbnailKey = StorageCore.getAssetThumbnailKey(userId, assetId);
+
+    // Return existing thumbnail if cached
+    const existing = await this.bucket.head(thumbnailKey);
+    if (existing) {
+      return thumbnailKey;
     }
 
-    try {
-      const buffer = await exiftool.extractBinaryTagToBuffer('JpgFromRaw', input);
-      return { buffer, format: RawExtractedFormat.Jpeg };
-    } catch (error: any) {
-      this.logger.debug(`Could not extract JPEG buffer from image, trying PreviewJXL next: ${error}`);
+    // Read original from R2
+    const original = await this.bucket.get(originalKey);
+    if (!original) {
+      throw new Error(`Original not found: ${originalKey}`);
     }
 
-    try {
-      const buffer = await exiftool.extractBinaryTagToBuffer('PreviewJXL', input);
-      return { buffer, format: RawExtractedFormat.Jxl };
-    } catch (error: any) {
-      this.logger.debug(`Could not extract PreviewJXL buffer from image, trying PreviewImage next: ${error}`);
+    // Transform via Cloudflare Image Resizing
+    const transformed = await this.transformImage(original, {
+      width: options.width,
+      height: options.height,
+      fit: 'cover',
+      format: (options.format as ImageTransformOptions['format']) || 'webp',
+      quality: options.quality || 80,
+    });
+
+    // Store in R2
+    const format = options.format || 'webp';
+    await this.bucket.put(thumbnailKey, transformed, {
+      httpMetadata: { contentType: `image/${format}` },
+    });
+
+    return thumbnailKey;
+  }
+
+  // -------------------------------------------------------------------------
+  // Preview generation
+  // -------------------------------------------------------------------------
+
+  /**
+   * Generate a preview (larger than thumbnail) using Cloudflare Image Resizing.
+   *
+   * @returns The R2 key where the preview is stored.
+   */
+  async generatePreview(
+    userId: string,
+    assetId: string,
+    originalKey: string,
+    options?: { maxDimension?: number; format?: string; quality?: number },
+  ): Promise<string> {
+    const previewKey = StorageCore.getAssetPreviewKey(userId, assetId);
+
+    // Return existing preview if cached
+    const existing = await this.bucket.head(previewKey);
+    if (existing) {
+      return previewKey;
     }
 
+    // Read original from R2
+    const original = await this.bucket.get(originalKey);
+    if (!original) {
+      throw new Error(`Original not found: ${originalKey}`);
+    }
+
+    const maxDim = options?.maxDimension || 1440;
+    const format = (options?.format as ImageTransformOptions['format']) || 'webp';
+    const quality = options?.quality || 80;
+
+    // Transform via Cloudflare Image Resizing
+    const transformed = await this.transformImage(original, {
+      width: maxDim,
+      height: maxDim,
+      fit: 'scale-down',
+      format,
+      quality,
+    });
+
+    // Store in R2
+    await this.bucket.put(previewKey, transformed, {
+      httpMetadata: { contentType: `image/${format}` },
+    });
+
+    return previewKey;
+  }
+
+  // -------------------------------------------------------------------------
+  // Fullsize generation
+  // -------------------------------------------------------------------------
+
+  /**
+   * Generate a fullsize converted image (e.g. HEIC to JPEG).
+   *
+   * @returns The R2 key where the fullsize image is stored.
+   */
+  async generateFullsize(
+    userId: string,
+    assetId: string,
+    originalKey: string,
+    options?: { format?: string; quality?: number },
+  ): Promise<string> {
+    const format = options?.format || 'jpeg';
+    const fullsizeKey = StorageCore.getAssetFullsizeKey(userId, assetId, format);
+
+    // Return existing if cached
+    const existing = await this.bucket.head(fullsizeKey);
+    if (existing) {
+      return fullsizeKey;
+    }
+
+    // Read original from R2
+    const original = await this.bucket.get(originalKey);
+    if (!original) {
+      throw new Error(`Original not found: ${originalKey}`);
+    }
+
+    // Convert format without resizing (use a very large dimension to avoid downscaling)
+    const transformed = await this.transformImage(original, {
+      width: 16384,
+      height: 16384,
+      fit: 'scale-down',
+      format: format as ImageTransformOptions['format'],
+      quality: options?.quality || 90,
+    });
+
+    await this.bucket.put(fullsizeKey, transformed, {
+      httpMetadata: { contentType: `image/${format}` },
+    });
+
+    return fullsizeKey;
+  }
+
+  // -------------------------------------------------------------------------
+  // EXIF extraction
+  // -------------------------------------------------------------------------
+
+  /**
+   * Extract EXIF metadata from an image using exifreader (pure JS).
+   * Replaces exiftool-vendored which requires native binaries.
+   */
+  async extractExif(data: ArrayBuffer): Promise<ExifData> {
     try {
-      const buffer = await exiftool.extractBinaryTagToBuffer('PreviewImage', input);
-      return { buffer, format: RawExtractedFormat.Jpeg };
-    } catch (error: any) {
-      this.logger.debug(`Could not extract preview buffer from image: ${error}`);
+      const tags = ExifReader.load(data, { expanded: true });
+      return mapExifTags(tags);
+    } catch (error) {
+      console.warn('EXIF extraction failed:', error);
+      return {};
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Image dimensions
+  // -------------------------------------------------------------------------
+
+  /**
+   * Get image dimensions from an image buffer using EXIF data.
+   */
+  async getImageDimensions(data: ArrayBuffer): Promise<ImageDimensions | null> {
+    try {
+      const tags = ExifReader.load(data);
+      const width =
+        tags['Image Width']?.value ??
+        tags['PixelXDimension']?.value ??
+        tags['ImageWidth']?.value;
+      const height =
+        tags['Image Height']?.value ??
+        tags['PixelYDimension']?.value ??
+        tags['ImageHeight']?.value;
+
+      if (width && height) {
+        return { width: Number(width), height: Number(height) };
+      }
+      return null;
+    } catch {
       return null;
     }
   }
 
-  async writeExif(tags: Partial<Exif>, output: string): Promise<boolean> {
-    try {
-      const tagsToWrite: WriteTags = {
-        ExifImageWidth: tags.exifImageWidth,
-        ExifImageHeight: tags.exifImageHeight,
-        DateTimeOriginal: tags.dateTimeOriginal && ExifDateTime.fromMillis(tags.dateTimeOriginal.getTime()),
-        ModifyDate: tags.modifyDate && ExifDateTime.fromMillis(tags.modifyDate.getTime()),
-        TimeZone: tags.timeZone,
-        GPSLatitude: tags.latitude,
-        GPSLongitude: tags.longitude,
-        ProjectionType: tags.projectionType,
-        City: tags.city,
-        Country: tags.country,
-        Make: tags.make,
-        Model: tags.model,
-        LensModel: tags.lensModel,
-        Fnumber: tags.fNumber?.toFixed(1),
-        FocalLength: tags.focalLength?.toFixed(1),
-        ISO: tags.iso,
-        ExposureTime: tags.exposureTime,
-        ProfileDescription: tags.profileDescription,
-        ColorSpace: tags.colorspace,
-        Rating: tags.rating,
-        // specially convert Orientation to numeric Orientation# for exiftool
-        'Orientation#': tags.orientation ? Number(tags.orientation) : undefined,
-      };
+  // -------------------------------------------------------------------------
+  // RAW file support (TODO stub)
+  // -------------------------------------------------------------------------
 
-      await exiftool.write(output, tagsToWrite, {
-        ignoreMinorErrors: true,
-        writeArgs: ['-overwrite_original'],
-      });
-      return true;
-    } catch (error: any) {
-      this.logger.warn(`Could not write exif data to image: ${error.message}`);
-      return false;
-    }
+  /**
+   * TODO: RAW file support
+   * RAW files are stored in R2 but thumbnail/preview generation is not yet supported.
+   * When implemented, use a WASM-based RAW decoder or extract embedded JPEG preview.
+   */
+  async generateRawPreview(
+    _userId: string,
+    _assetId: string,
+    _originalKey: string,
+  ): Promise<string | null> {
+    console.warn('RAW file preview generation not yet supported');
+    return null;
   }
 
-  async copyTagGroup(tagGroup: string, source: string, target: string): Promise<boolean> {
+  // -------------------------------------------------------------------------
+  // Video thumbnail support (TODO stub)
+  // -------------------------------------------------------------------------
+
+  /**
+   * TODO: Video thumbnail generation
+   * Requires a video processing service (e.g., Cloudflare Stream or external API).
+   * For now, videos are stored without thumbnails.
+   */
+  async generateVideoThumbnail(
+    _userId: string,
+    _assetId: string,
+    _originalKey: string,
+  ): Promise<string | null> {
+    console.warn('Video thumbnail generation not yet supported');
+    return null;
+  }
+
+  // -------------------------------------------------------------------------
+  // Internal helpers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Transform an image using Cloudflare Image Resizing.
+   *
+   * This sends a subrequest to the worker's own zone with `cf.image` options.
+   * The zone must have Image Resizing enabled in the Cloudflare dashboard.
+   *
+   * For R2 objects, we POST the image body to a transform endpoint, which
+   * applies the cf.image options and returns the transformed image.
+   */
+  private async transformImage(
+    original: R2ObjectBody,
+    options: ImageTransformOptions,
+  ): Promise<ArrayBuffer> {
+    // If no base URL is configured (e.g. in tests / dev), skip image resizing
+    // and return the original bytes.
+    if (!this.imageResizingBaseUrl) {
+      return original.arrayBuffer();
+    }
+
+    const contentType = original.httpMetadata?.contentType || 'image/jpeg';
+
+    let url: URL;
     try {
-      await exiftool.write(
-        target,
-        {},
-        {
-          ignoreMinorErrors: true,
-          writeArgs: ['-TagsFromFile', source, `-${tagGroup}:all>${tagGroup}:all`, '-overwrite_original'],
-        },
+      url = new URL(
+        `/cdn-cgi/image/w=${options.width},h=${options.height},fit=${options.fit || 'scale-down'},f=${options.format || 'webp'},q=${options.quality || 80}/original`,
+        this.imageResizingBaseUrl,
       );
-      return true;
-    } catch (error: any) {
-      this.logger.warn(`Could not copy tag data to image: ${error.message}`);
-      return false;
-    }
-  }
-
-  async decodeImage(input: string | Buffer, options: DecodeToBufferOptions) {
-    const pipeline = await this.getImageDecodingPipeline(input, options);
-    return pipeline.raw().toBuffer({ resolveWithObject: true });
-  }
-
-  private async applyEdits(pipeline: sharp.Sharp, edits: AssetEditActionItem[]): Promise<sharp.Sharp> {
-    const affineEditOperations = edits.filter((edit) => edit.action !== 'crop');
-    const matrix = createAffineMatrix(affineEditOperations);
-
-    const crop = edits.find((edit) => edit.action === 'crop');
-    const dimensions = await pipeline.metadata();
-
-    if (crop) {
-      pipeline = pipeline.extract({
-        left: crop ? Math.round(crop.parameters.x) : 0,
-        top: crop ? Math.round(crop.parameters.y) : 0,
-        width: crop ? Math.round(crop.parameters.width) : dimensions.width || 0,
-        height: crop ? Math.round(crop.parameters.height) : dimensions.height || 0,
-      });
+    } catch {
+      // Invalid base URL — fall back to original
+      return original.arrayBuffer();
     }
 
-    const { a, b, c, d } = matrix;
-    pipeline = pipeline.affine([
-      [a, b],
-      [c, d],
-    ]);
-
-    return pipeline;
-  }
-
-  async generateThumbnail(input: string | Buffer, options: GenerateThumbnailOptions, output: string): Promise<void> {
-    const pipeline = await this.getImageDecodingPipeline(input, options);
-    const decoded = pipeline.toFormat(options.format, {
-      quality: options.quality,
-      // this is default in libvips (except the threshold is 90), but we need to set it manually in sharp
-      chromaSubsampling: options.quality >= 80 ? '4:4:4' : '4:2:0',
-      progressive: options.progressive,
+    const request = new Request(url.toString(), {
+      method: 'GET',
+      headers: { 'Content-Type': contentType },
     });
 
-    await decoded.toFile(output);
-  }
-
-  private async getImageDecodingPipeline(input: string | Buffer, options: DecodeToBufferOptions) {
-    let pipeline = sharp(input, {
-      // some invalid images can still be processed by sharp, but we want to fail on them by default to avoid crashes
-      failOn: options.processInvalidImages ? 'none' : 'error',
-      limitInputPixels: false,
-      raw: options.raw,
-      unlimited: true,
-    })
-      .pipelineColorspace(options.colorspace === Colorspace.Srgb ? 'srgb' : 'rgb16')
-      .withIccProfile(options.colorspace);
-
-    if (!options.raw) {
-      const { angle, flip, flop } = options.orientation ? ORIENTATION_TO_SHARP_ROTATION[options.orientation] : {};
-      pipeline = pipeline.rotate(angle);
-      if (flip) {
-        pipeline = pipeline.flip();
-      }
-
-      if (flop) {
-        pipeline = pipeline.flop();
-      }
-    }
-
-    if (options.edits && options.edits.length > 0) {
-      pipeline = await this.applyEdits(pipeline, options.edits);
-    }
-
-    if (options.size !== undefined) {
-      pipeline = pipeline.resize(options.size, options.size, { fit: 'outside', withoutEnlargement: true });
-    }
-    return pipeline;
-  }
-
-  async generateThumbhash(input: string | Buffer, options: GenerateThumbhashOptions): Promise<Buffer> {
-    const [{ rgbaToThumbHash }, decodingPipeline] = await Promise.all([
-      import('thumbhash'),
-      this.getImageDecodingPipeline(input, {
-        colorspace: options.colorspace,
-        processInvalidImages: options.processInvalidImages,
-        raw: options.raw,
-        edits: options.edits,
-      }),
-    ]);
-
-    const pipeline = decodingPipeline.resize(100, 100, { fit: 'inside', withoutEnlargement: true }).raw().ensureAlpha();
-
-    const { data, info } = await pipeline.toBuffer({ resolveWithObject: true });
-
-    return Buffer.from(rgbaToThumbHash(info.width, info.height, data));
-  }
-
-  async probe(input: string, options?: ProbeOptions): Promise<VideoInfo> {
-    const results = await probe(input, options?.countFrames ? ['-count_packets'] : []); // gets frame count quickly: https://stackoverflow.com/a/28376817
-    return {
-      format: {
-        formatName: results.format.format_name,
-        formatLongName: results.format.format_long_name,
-        duration: this.parseFloat(results.format.duration),
-        bitrate: this.parseInt(results.format.bit_rate),
+    // Use Cloudflare Image Resizing via cf.image on the fetch
+    const response = await fetch(request, {
+      cf: {
+        image: {
+          width: options.width,
+          height: options.height,
+          fit: options.fit || 'scale-down',
+          format: options.format || 'webp',
+          quality: options.quality || 80,
+        },
       },
-      videoStreams: results.streams
-        .filter((stream) => stream.codec_type === 'video')
-        .filter((stream) => !stream.disposition?.attached_pic)
-        .map((stream) => ({
-          index: stream.index,
-          height: this.parseInt(stream.height),
-          width: this.parseInt(stream.width),
-          codecName: stream.codec_name === 'h265' ? 'hevc' : stream.codec_name,
-          codecType: stream.codec_type,
-          frameCount: this.parseInt(options?.countFrames ? stream.nb_read_packets : stream.nb_frames),
-          rotation: this.parseInt(stream.rotation),
-          isHDR: stream.color_transfer === 'smpte2084' || stream.color_transfer === 'arib-std-b67',
-          bitrate: this.parseInt(stream.bit_rate),
-          pixelFormat: stream.pix_fmt || 'yuv420p',
-          colorPrimaries: stream.color_primaries,
-          colorSpace: stream.color_space,
-          colorTransfer: stream.color_transfer,
-        })),
-      audioStreams: results.streams
-        .filter((stream) => stream.codec_type === 'audio')
-        .map((stream) => ({
-          index: stream.index,
-          codecType: stream.codec_type,
-          codecName: stream.codec_name,
-          bitrate: this.parseInt(stream.bit_rate),
-        })),
-    };
-  }
+    } as RequestInit);
 
-  transcode(input: string, output: string | Writable, options: TranscodeCommand): Promise<void> {
-    if (!options.twoPass) {
-      return new Promise((resolve, reject) => {
-        this.configureFfmpegCall(input, output, options)
-          .on('error', reject)
-          .on('end', () => resolve())
-          .run();
-      });
+    if (!response.ok) {
+      // Fallback: if Image Resizing is not available, store the original as-is
+      console.warn(
+        `Image Resizing returned ${response.status}. ` +
+        'Ensure the zone has Image Resizing enabled. Falling back to original.',
+      );
+      return original.arrayBuffer();
     }
 
-    if (typeof output !== 'string') {
-      throw new TypeError('Two-pass transcoding does not support writing to a stream');
-    }
+    return response.arrayBuffer();
+  }
+}
 
-    // two-pass allows for precise control of bitrate at the cost of running twice
-    // recommended for vp9 for better quality and compression
-    return new Promise((resolve, reject) => {
-      // first pass output is not saved as only the .log file is needed
-      this.configureFfmpegCall(input, '/dev/null', options)
-        .addOptions('-pass', '1')
-        .addOptions('-passlogfile', output)
-        .addOptions('-f null')
-        .on('error', reject)
-        .on('end', () => {
-          // second pass
-          this.configureFfmpegCall(input, output, options)
-            .addOptions('-pass', '2')
-            .addOptions('-passlogfile', output)
-            .on('error', reject)
-            .on('end', () => handlePromiseError(fs.unlink(`${output}-0.log`), this.logger))
-            .on('end', () => handlePromiseError(fs.rm(`${output}-0.log.mbtree`, { force: true }), this.logger))
-            .on('end', () => resolve())
-            .run();
-        })
-        .run();
-    });
+// ---------------------------------------------------------------------------
+// EXIF mapping helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Map exifreader tags to our ExifData interface.
+ * exifreader returns tags in an expanded format when { expanded: true } is used.
+ */
+function mapExifTags(tags: Record<string, any>): ExifData {
+  const exif: ExifData = {};
+
+  // Camera info
+  exif.make = tags.exif?.Make?.description;
+  exif.model = tags.exif?.Model?.description;
+
+  // Exposure info
+  exif.exposureTime = tags.exif?.ExposureTime?.description;
+  if (tags.exif?.FNumber?.value && Array.isArray(tags.exif.FNumber.value)) {
+    exif.fNumber = tags.exif.FNumber.value[0] / tags.exif.FNumber.value[1];
+  } else if (tags.exif?.FNumber?.description) {
+    exif.fNumber = Number.parseFloat(tags.exif.FNumber.description);
   }
 
-  async getImageDimensions(input: string | Buffer): Promise<ImageDimensions> {
-    const { width = 0, height = 0 } = await sharp(input).metadata();
-    return { width, height };
+  exif.iso = typeof tags.exif?.ISOSpeedRatings?.value === 'number'
+    ? tags.exif.ISOSpeedRatings.value
+    : undefined;
+
+  if (tags.exif?.FocalLength?.value && Array.isArray(tags.exif.FocalLength.value)) {
+    exif.focalLength = tags.exif.FocalLength.value[0] / tags.exif.FocalLength.value[1];
+  } else if (tags.exif?.FocalLength?.description) {
+    exif.focalLength = Number.parseFloat(tags.exif.FocalLength.description);
   }
 
-  private configureFfmpegCall(input: string, output: string | Writable, options: TranscodeCommand) {
-    const ffmpegCall = ffmpeg(input, { niceness: 10 })
-      .inputOptions(options.inputOptions)
-      .outputOptions(options.outputOptions)
-      .output(output)
-      .on('start', (command: string) => this.logger.debug(command))
-      .on('error', (error, _, stderr) => this.logger.error(stderr || error));
+  exif.lensModel = tags.exif?.LensModel?.description;
 
-    const { frameCount, percentInterval } = options.progress;
-    const frameInterval = Math.ceil(frameCount / (100 / percentInterval));
-    if (this.logger.isLevelEnabled(LogLevel.Debug) && frameCount && frameInterval) {
-      let lastProgressFrame: number = 0;
-      ffmpegCall.on('progress', (progress: ProgressEvent) => {
-        if (progress.frames - lastProgressFrame < frameInterval) {
-          return;
-        }
+  // Date/time
+  exif.dateTimeOriginal = tags.exif?.DateTimeOriginal?.description;
+  exif.modifyDate = tags.exif?.ModifyDate?.description ?? tags.exif?.DateTime?.description;
 
-        lastProgressFrame = progress.frames;
-        const percent = ((progress.frames / frameCount) * 100).toFixed(2);
-        const ms = progress.currentFps ? Math.floor((frameCount - progress.frames) / progress.currentFps) * 1000 : 0;
-        const duration = ms ? Duration.fromMillis(ms).rescale().toHuman({ unitDisplay: 'narrow' }) : '';
-        const outputText = output instanceof Writable ? 'stream' : output.split('/').pop();
-        this.logger.debug(
-          `Transcoding ${percent}% done${duration ? `, estimated ${duration} remaining` : ''} for output ${outputText}`,
-        );
-      });
-    }
-
-    return ffmpegCall;
+  // GPS coordinates
+  if (tags.gps) {
+    exif.latitude = typeof tags.gps.Latitude === 'number' ? tags.gps.Latitude : undefined;
+    exif.longitude = typeof tags.gps.Longitude === 'number' ? tags.gps.Longitude : undefined;
   }
 
-  private parseInt(value: string | number | undefined): number {
-    return Number.parseInt(value as string) || 0;
+  // Orientation
+  if (tags.exif?.Orientation?.value) {
+    exif.orientation = String(tags.exif.Orientation.value);
   }
 
-  private parseFloat(value: string | number | undefined): number {
-    return Number.parseFloat(value as string) || 0;
+  // Dimensions
+  const width = tags.exif?.PixelXDimension?.value ?? tags.exif?.ImageWidth?.value;
+  const height = tags.exif?.PixelYDimension?.value ?? tags.exif?.ImageHeight?.value;
+  if (width) exif.exifImageWidth = Number(width);
+  if (height) exif.exifImageHeight = Number(height);
+
+  // Description — check both EXIF and IPTC
+  exif.description =
+    tags.exif?.ImageDescription?.description ??
+    tags.iptc?.['Caption/Abstract']?.description ??
+    tags.iptc?.caption?.description;
+
+  // Color / profile info
+  exif.profileDescription = tags.icc?.['Profile Description']?.description;
+  exif.colorspace = tags.exif?.ColorSpace?.description;
+  if (tags.exif?.BitsPerSample?.value) {
+    exif.bitsPerSample = Number(tags.exif.BitsPerSample.value);
   }
+
+  // Rating
+  if (tags.xmp?.Rating?.value !== undefined) {
+    exif.rating = Number(tags.xmp.Rating.value);
+  }
+
+  return exif;
 }
