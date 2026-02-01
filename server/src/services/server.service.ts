@@ -42,16 +42,28 @@ export class ServerService {
   }
 
   async getStorage() {
-    // In Workers/R2 environment, disk usage is not applicable
+    const diskSizeRaw = 1_000_000_000_000; // 1 TB
+    const stats = await this.getStatistics();
+    const diskUseRaw = stats.usage;
+    const diskAvailableRaw = diskSizeRaw - diskUseRaw;
+    const diskUsagePercentage = diskSizeRaw > 0 ? Math.round((diskUseRaw / diskSizeRaw) * 100) : 0;
+
     return {
-      diskAvailable: 'N/A',
-      diskSize: 'N/A',
-      diskUse: 'N/A',
-      diskAvailableRaw: 0,
-      diskSizeRaw: 0,
-      diskUseRaw: 0,
-      diskUsagePercentage: 0,
+      diskAvailable: this.formatBytes(diskAvailableRaw),
+      diskSize: this.formatBytes(diskSizeRaw),
+      diskUse: this.formatBytes(diskUseRaw),
+      diskAvailableRaw,
+      diskSizeRaw,
+      diskUseRaw,
+      diskUsagePercentage,
     };
+  }
+
+  private formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
   }
 
   ping() {

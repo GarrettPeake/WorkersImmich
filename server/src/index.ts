@@ -26,8 +26,13 @@ import apiKeyRoutes from './routes/api-keys';
 import viewRoutes from './routes/view';
 import authRoutes from './routes/auth';
 import sessionRoutes from './routes/sessions';
+import { handleSocketIO } from './routes/socket';
 
 const app = new Hono<AppEnv>();
+
+// Socket.IO stub — must be before other middleware (no DB/service context needed)
+app.all('/api/socket.io/*', (c) => handleSocketIO(c.req.raw));
+app.all('/api/socket.io', (c) => handleSocketIO(c.req.raw));
 
 // Global error handler
 app.onError((err, c) => {
