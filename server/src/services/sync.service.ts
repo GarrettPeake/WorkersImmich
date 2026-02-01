@@ -249,7 +249,7 @@ export class SyncService {
           return;
         }
 
-        const nowId = crypto.randomUUID();
+        const nowId = this.generateTimestampId();
         let totalItemsStreamed = 0;
 
         // Process requested sync types in order
@@ -375,6 +375,25 @@ export class SyncService {
   // Private helpers
   // ---------------------------------------------------------------------------
 
+  /**
+   * Generate a UUID v7-compatible ID where the first 48 bits encode the
+   * current millisecond timestamp.  This is required so that needsFullSync()
+   * can extract a meaningful date from the SyncCompleteV1 ack.
+   */
+  private generateTimestampId(): string {
+    const now = Date.now();
+    const hex = now.toString(16).padStart(12, '0');
+    const rand = crypto.randomUUID().replace(/-/g, '').slice(12);
+    const full = hex + rand;
+    return [
+      full.slice(0, 8),
+      full.slice(8, 12),
+      full.slice(12, 16),
+      full.slice(16, 20),
+      full.slice(20, 32),
+    ].join('-');
+  }
+
   private needsFullSync(checkpointMap: CheckpointMap): boolean {
     const completeAck = checkpointMap[SyncEntityType.SyncCompleteV1];
     if (!completeAck) {
@@ -412,11 +431,12 @@ export class SyncService {
       case SyncRequestType.AuthUsersV1:
         count = await this.syncSimpleUpsert(stream, 'user', SyncEntityType.AuthUserV1, checkpointMap, {
           ownerFilter: userId,
+          ownerColumn: 'id',
           mapRow: (row: any) => ({
             id: row.id,
             name: row.name,
             email: row.email,
-            avatarColor: row.avatarColor,
+            avatarColor: row.avatarColor ?? 'primary',
             deletedAt: row.deletedAt,
             hasProfileImage: !!row.profileImagePath,
             profileChangedAt: row.profileChangedAt,
@@ -441,7 +461,7 @@ export class SyncService {
             id: row.id,
             name: row.name,
             email: row.email,
-            avatarColor: row.avatarColor,
+            avatarColor: row.avatarColor ?? 'primary',
             deletedAt: row.deletedAt,
             hasProfileImage: !!row.profileImagePath,
             profileChangedAt: row.profileChangedAt,
@@ -999,34 +1019,28 @@ export class SyncService {
     return count;
   }
 
-  private mapSyncAsset(row: any) {
-    let checksum = '';
-    if (row.checksum) {
-      if (row.checksum instanceof Uint8Array) {
-        const bytes = row.checksum;
-        let binary = '';
-        for (let i = 0; i < bytes.length; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        checksum = btoa(binary);
-      } else if (typeof row.checksum === 'string') {
-        checksum = row.checksum;
-      }
+  private blobToBase64(value: unknown): string {
+    let bytes: Uint8Array | undefined;
+    if (value instanceof Uint8Array) {
+      bytes = value;
+    } else if (value instanceof ArrayBuffer) {
+      bytes = new Uint8Array(value);
+    } else if (Array.isArray(value)) {
+      bytes = new Uint8Array(value);
+    } else if (typeof value === 'string') {
+      return value;
     }
+    if (!bytes || bytes.length === 0) return '';
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  }
 
-    let thumbhash: string | null = null;
-    if (row.thumbhash) {
-      if (row.thumbhash instanceof Uint8Array) {
-        const bytes = row.thumbhash;
-        let binary = '';
-        for (let i = 0; i < bytes.length; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        thumbhash = btoa(binary);
-      } else if (typeof row.thumbhash === 'string') {
-        thumbhash = row.thumbhash;
-      }
-    }
+  private mapSyncAsset(row: any) {
+    const checksum = row.checksum ? this.blobToBase64(row.checksum) : '';
+    const thumbhash = row.thumbhash ? this.blobToBase64(row.thumbhash) || null : null;
 
     return {
       id: row.id,

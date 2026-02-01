@@ -8,6 +8,7 @@
 import type { AuthDto } from 'src/dtos/auth.dto';
 import type { ServiceContext } from 'src/context';
 import { mapPreferences } from 'src/dtos/user-preferences.dto';
+import { mapUser, mapUserAdmin } from 'src/dtos/user.dto';
 import { UserMetadataKey } from 'src/enum';
 import { UserRepository } from 'src/repositories/user.repository';
 import { getPreferences, mergePreferences } from 'src/utils/preferences';
@@ -26,14 +27,7 @@ export class UserService {
   async search(auth: AuthDto) {
     // For Workers, return all non-deleted users (simplified -- config check omitted)
     const users = await this.userRepository.getList({ withDeleted: false });
-    return users.map((user: any) => ({
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      profileImagePath: user.profileImagePath,
-      avatarColor: user.avatarColor,
-      profileChangedAt: user.profileChangedAt,
-    }));
+    return users.map((user: any) => mapUser(user));
   }
 
   async getMe(auth: AuthDto) {
@@ -41,7 +35,7 @@ export class UserService {
     if (!user) {
       throw new Error('User not found');
     }
-    return user;
+    return mapUserAdmin(user as any);
   }
 
   async updateMe(auth: AuthDto, dto: any) {
@@ -64,8 +58,9 @@ export class UserService {
       update.shouldChangePassword = 0;
     }
 
-    const updatedUser = await this.userRepository.update(auth.user.id, update);
-    return updatedUser;
+    await this.userRepository.update(auth.user.id, update);
+    const updatedUser = await this.userRepository.get(auth.user.id, {});
+    return mapUserAdmin(updatedUser as any);
   }
 
   async getMyPreferences(auth: AuthDto) {
@@ -98,14 +93,7 @@ export class UserService {
     if (!user) {
       throw new Error('User not found');
     }
-    return {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      profileImagePath: user.profileImagePath,
-      avatarColor: user.avatarColor,
-      profileChangedAt: user.profileChangedAt,
-    };
+    return mapUser(user as any);
   }
 
   async createProfileImage(auth: AuthDto, fileData: ArrayBuffer, fileName: string) {
