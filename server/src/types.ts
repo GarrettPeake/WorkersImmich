@@ -1,26 +1,17 @@
 import { SystemConfig } from 'src/config';
-import { VECTOR_EXTENSIONS } from 'src/constants';
 import { Asset, AssetFile } from 'src/database';
-import { UploadFieldName } from 'src/dtos/asset-media.dto';
 import { AuthDto } from 'src/dtos/auth.dto';
-import { AssetEditActionItem } from 'src/dtos/editing.dto';
-import { SetMaintenanceModeDto } from 'src/dtos/maintenance.dto';
 import {
   AssetOrder,
   AssetType,
-  DatabaseSslMode,
+  AssetVisibility,
   ExifOrientation,
   ImageFormat,
-  JobName,
   MemoryType,
-  PluginTriggerType,
-  QueueName,
   StorageFolder,
   SyncEntityType,
   SystemMetadataKey,
-  TranscodeTarget,
   UserMetadataKey,
-  VideoCodec,
 } from 'src/enum';
 
 export type DeepPartial<T> =
@@ -32,13 +23,6 @@ export type DeepPartial<T> =
 
 export type RepositoryInterface<T extends object> = Pick<T, keyof T>;
 
-export type FullsizeImageOptions = {
-  format: ImageFormat;
-  quality: number;
-  enabled: boolean;
-  progressive?: boolean;
-};
-
 export type ImageOptions = {
   format: ImageFormat;
   quality: number;
@@ -46,384 +30,9 @@ export type ImageOptions = {
   progressive?: boolean;
 };
 
-export type RawImageInfo = {
-  width: number;
-  height: number;
-  channels: 1 | 2 | 3 | 4;
-};
-
-type DecodeImageOptions = {
-  colorspace: string;
-  processInvalidImages: boolean;
-  raw?: RawImageInfo;
-  edits?: AssetEditActionItem[];
-};
-
-export interface DecodeToBufferOptions extends DecodeImageOptions {
-  size?: number;
-  orientation?: ExifOrientation;
-}
-
-export type GenerateThumbnailOptions = Pick<ImageOptions, 'format' | 'quality' | 'progressive'> & DecodeToBufferOptions;
-
-export type GenerateThumbnailFromBufferOptions = GenerateThumbnailOptions & { raw: RawImageInfo };
-
-export type GenerateThumbhashOptions = DecodeImageOptions;
-
-export type GenerateThumbhashFromBufferOptions = GenerateThumbhashOptions & { raw: RawImageInfo };
-
-export interface GenerateThumbnailsOptions {
-  colorspace: string;
-  preview?: ImageOptions;
-  processInvalidImages: boolean;
-  thumbhash?: boolean;
-  thumbnail?: ImageOptions;
-}
-
-export interface VideoStreamInfo {
-  index: number;
-  height: number;
-  width: number;
-  rotation: number;
-  codecName?: string;
-  frameCount: number;
-  isHDR: boolean;
-  bitrate: number;
-  pixelFormat: string;
-  colorPrimaries?: string;
-  colorSpace?: string;
-  colorTransfer?: string;
-}
-
-export interface AudioStreamInfo {
-  index: number;
-  codecName?: string;
-  bitrate: number;
-}
-
-export interface VideoFormat {
-  formatName?: string;
-  formatLongName?: string;
-  duration: number;
-  bitrate: number;
-}
-
 export interface ImageDimensions {
   width: number;
   height: number;
-}
-
-export interface InputDimensions extends ImageDimensions {
-  inputPath: string;
-}
-
-export interface VideoInfo {
-  format: VideoFormat;
-  videoStreams: VideoStreamInfo[];
-  audioStreams: AudioStreamInfo[];
-}
-
-export interface TranscodeCommand {
-  inputOptions: string[];
-  outputOptions: string[];
-  twoPass: boolean;
-  progress: {
-    frameCount: number;
-    percentInterval: number;
-  };
-}
-
-export interface BitrateDistribution {
-  max: number;
-  target: number;
-  min: number;
-  unit: string;
-}
-
-export interface ImageBuffer {
-  data: Buffer;
-  info: RawImageInfo;
-}
-
-export interface VideoCodecSWConfig {
-  getCommand(
-    target: TranscodeTarget,
-    videoStream: VideoStreamInfo,
-    audioStream: AudioStreamInfo,
-    format?: VideoFormat,
-  ): TranscodeCommand;
-}
-
-export interface VideoCodecHWConfig extends VideoCodecSWConfig {
-  getSupportedCodecs(): Array<VideoCodec>;
-}
-
-export interface ProbeOptions {
-  countFrames: boolean;
-}
-
-export interface VideoInterfaces {
-  dri: string[];
-  mali: boolean;
-}
-
-export type ConcurrentQueueName = Exclude<
-  QueueName,
-  | QueueName.StorageTemplateMigration
-  | QueueName.FacialRecognition
-  | QueueName.DuplicateDetection
-  | QueueName.BackupDatabase
->;
-
-export type Jobs = { [K in JobItem['name']]: (JobItem & { name: K })['data'] };
-export type JobOf<T extends JobName> = Jobs[T];
-
-export interface IBaseJob {
-  force?: boolean;
-}
-
-export interface IDelayedJob extends IBaseJob {
-  /** The minimum time to wait to execute this job, in milliseconds. */
-  delay?: number;
-}
-
-export type JobSource = 'upload' | 'sidecar-write' | 'copy' | 'edit';
-export interface IEntityJob extends IBaseJob {
-  id: string;
-  source?: JobSource;
-  notify?: boolean;
-}
-
-export interface IAssetDeleteJob extends IEntityJob {
-  deleteOnDisk: boolean;
-}
-
-export interface ILibraryFileJob {
-  libraryId: string;
-  paths: string[];
-  progressCounter?: number;
-  totalAssets?: number;
-}
-
-export interface ILibraryBulkIdsJob {
-  libraryId: string;
-  importPaths: string[];
-  exclusionPatterns: string[];
-  assetIds: string[];
-  progressCounter: number;
-  totalAssets: number;
-}
-
-export interface IBulkEntityJob {
-  ids: string[];
-}
-
-export interface IDeleteFilesJob extends IBaseJob {
-  files: Array<string | null | undefined>;
-}
-
-export interface ISidecarWriteJob extends IEntityJob {
-  tags?: true;
-}
-
-export interface IDeferrableJob extends IEntityJob {
-  deferred?: boolean;
-}
-
-export interface INightlyJob extends IBaseJob {
-  nightly?: boolean;
-}
-
-export type EmailImageAttachment = {
-  filename: string;
-  path: string;
-  cid: string;
-};
-
-export interface IEmailJob {
-  to: string;
-  subject: string;
-  html: string;
-  text: string;
-  imageAttachments?: EmailImageAttachment[];
-}
-
-export interface INotifySignupJob extends IEntityJob {
-  password?: string;
-}
-
-export interface INotifyAlbumInviteJob extends IEntityJob {
-  recipientId: string;
-}
-
-export interface INotifyAlbumUpdateJob extends IEntityJob, IDelayedJob {
-  recipientId: string;
-}
-
-export interface WorkflowData {
-  [PluginTriggerType.AssetCreate]: {
-    userId: string;
-    asset: Asset;
-  };
-  [PluginTriggerType.PersonRecognized]: {
-    personId: string;
-    assetId: string;
-  };
-}
-
-export interface IWorkflowJob<T extends PluginTriggerType = PluginTriggerType> {
-  id: string;
-  type: T;
-  event: WorkflowData[T];
-}
-
-export interface JobCounts {
-  active: number;
-  completed: number;
-  failed: number;
-  delayed: number;
-  waiting: number;
-  paused: number;
-}
-
-export type JobItem =
-  // Audit
-  | { name: JobName.AuditTableCleanup; data?: IBaseJob }
-
-  // Backups
-  | { name: JobName.DatabaseBackup; data?: IBaseJob }
-
-  // Transcoding
-  | { name: JobName.AssetEncodeVideoQueueAll; data: IBaseJob }
-  | { name: JobName.AssetEncodeVideo; data: IEntityJob }
-
-  // Thumbnails
-  | { name: JobName.AssetGenerateThumbnailsQueueAll; data: IBaseJob }
-  | { name: JobName.AssetGenerateThumbnails; data: IEntityJob }
-
-  // User
-  | { name: JobName.UserDeleteCheck; data?: IBaseJob }
-  | { name: JobName.UserDelete; data: IEntityJob }
-  | { name: JobName.UserSyncUsage; data?: IBaseJob }
-
-  // Storage Template
-  | { name: JobName.StorageTemplateMigration; data?: IBaseJob }
-  | { name: JobName.StorageTemplateMigrationSingle; data: IEntityJob }
-
-  // Migration
-  | { name: JobName.FileMigrationQueueAll; data?: IBaseJob }
-  | { name: JobName.AssetFileMigration; data: IEntityJob }
-  | { name: JobName.PersonFileMigration; data: IEntityJob }
-
-  // Metadata Extraction
-  | { name: JobName.AssetExtractMetadataQueueAll; data: IBaseJob }
-  | { name: JobName.AssetExtractMetadata; data: IEntityJob }
-
-  // Notifications
-  | { name: JobName.NotificationsCleanup; data?: IBaseJob }
-
-  // Sidecar Scanning
-  | { name: JobName.SidecarQueueAll; data: IBaseJob }
-  | { name: JobName.SidecarCheck; data: IEntityJob }
-  | { name: JobName.SidecarWrite; data: IEntityJob }
-
-  // Facial Recognition
-  | { name: JobName.AssetDetectFacesQueueAll; data: IBaseJob }
-  | { name: JobName.AssetDetectFaces; data: IEntityJob }
-  | { name: JobName.FacialRecognitionQueueAll; data: INightlyJob }
-  | { name: JobName.FacialRecognition; data: IDeferrableJob }
-  | { name: JobName.PersonGenerateThumbnail; data: IEntityJob }
-
-  // Smart Search
-  | { name: JobName.SmartSearchQueueAll; data: IBaseJob }
-  | { name: JobName.SmartSearch; data: IEntityJob }
-  | { name: JobName.AssetEmptyTrash; data?: IBaseJob }
-
-  // Duplicate Detection
-  | { name: JobName.AssetDetectDuplicatesQueueAll; data: IBaseJob }
-  | { name: JobName.AssetDetectDuplicates; data: IEntityJob }
-
-  // Memories
-  | { name: JobName.MemoryCleanup; data?: IBaseJob }
-  | { name: JobName.MemoryGenerate; data?: IBaseJob }
-
-  // Filesystem
-  | { name: JobName.FileDelete; data: IDeleteFilesJob }
-
-  // Cleanup
-  | { name: JobName.AuditLogCleanup; data?: IBaseJob }
-  | { name: JobName.SessionCleanup; data?: IBaseJob }
-
-  // Tags
-  | { name: JobName.TagCleanup; data?: IBaseJob }
-
-  // Asset Deletion
-  | { name: JobName.PersonCleanup; data?: IBaseJob }
-  | { name: JobName.AssetDelete; data: IAssetDeleteJob }
-  | { name: JobName.AssetDeleteCheck; data?: IBaseJob }
-
-  // Library Management
-  | { name: JobName.LibrarySyncFiles; data: ILibraryFileJob }
-  | { name: JobName.LibrarySyncFilesQueueAll; data: IEntityJob }
-  | { name: JobName.LibrarySyncAssetsQueueAll; data: IEntityJob }
-  | { name: JobName.LibrarySyncAssets; data: ILibraryBulkIdsJob }
-  | { name: JobName.LibraryRemoveAsset; data: ILibraryFileJob }
-  | { name: JobName.LibraryDelete; data: IEntityJob }
-  | { name: JobName.LibraryScanQueueAll; data?: IBaseJob }
-  | { name: JobName.LibraryDeleteCheck; data: IBaseJob }
-
-  // Notification
-  | { name: JobName.SendMail; data: IEmailJob }
-  | { name: JobName.NotifyAlbumInvite; data: INotifyAlbumInviteJob }
-  | { name: JobName.NotifyAlbumUpdate; data: INotifyAlbumUpdateJob }
-  | { name: JobName.NotifyUserSignup; data: INotifySignupJob }
-
-  // Version check
-  | { name: JobName.VersionCheck; data: IBaseJob }
-
-  // OCR
-  | { name: JobName.OcrQueueAll; data: IBaseJob }
-  | { name: JobName.Ocr; data: IEntityJob }
-
-  // Workflow
-  | { name: JobName.WorkflowRun; data: IWorkflowJob }
-
-  // Editor
-  | { name: JobName.AssetEditThumbnailGeneration; data: IEntityJob };
-
-export type VectorExtension = (typeof VECTOR_EXTENSIONS)[number];
-
-export type DatabaseConnectionURL = {
-  connectionType: 'url';
-  url: string;
-};
-
-export type DatabaseConnectionParts = {
-  connectionType: 'parts';
-  host: string;
-  port: number;
-  username: string;
-  password: string;
-  database: string;
-  ssl?: DatabaseSslMode;
-};
-
-export type DatabaseConnectionParams = DatabaseConnectionURL | DatabaseConnectionParts;
-
-export interface ExtensionVersion {
-  name: VectorExtension;
-  availableVersion: string | null;
-  installedVersion: string | null;
-}
-
-export interface VectorUpdateResult {
-  restartRequired: boolean;
-}
-
-export interface ImmichFile extends Express.Multer.File {
-  uuid: string;
-  /** sha1 hash of file */
-  checksum: Buffer;
 }
 
 export interface UploadFile {
@@ -441,7 +50,7 @@ export interface UploadBody {
 
 export type UploadRequest = {
   auth: AuthDto | null;
-  fieldName: UploadFieldName;
+  fieldName: string;
   file: UploadFile;
   body: UploadBody;
 };
@@ -449,6 +58,18 @@ export type UploadRequest = {
 export interface UploadFiles {
   assetData: ImmichFile[];
   sidecarData: ImmichFile[];
+}
+
+export interface ImmichFile {
+  uuid: string;
+  /** sha1 hash of file */
+  checksum: Buffer;
+  fieldname: string;
+  originalname: string;
+  encoding: string;
+  mimetype: string;
+  size: number;
+  buffer?: Buffer;
 }
 
 export interface IBulkAsset {
@@ -490,21 +111,17 @@ export interface MemoryData {
 export type VersionCheckMetadata = { checkedAt: string; releaseVersion: string };
 export type SystemFlags = { mountChecks: Record<StorageFolder, boolean> };
 export type MaintenanceModeState =
-  | { isMaintenanceMode: true; secret: string; action?: SetMaintenanceModeDto }
+  | { isMaintenanceMode: true; secret: string }
   | { isMaintenanceMode: false };
 export type MemoriesState = {
   /** memories have already been created through this date */
   lastOnThisDayDate: string;
 };
-export type MediaLocation = { location: string };
 
 export interface SystemMetadata extends Record<SystemMetadataKey, Record<string, any>> {
   [SystemMetadataKey.AdminOnboarding]: { isOnboarded: boolean };
-  [SystemMetadataKey.FacialRecognitionState]: { lastRun?: string };
   [SystemMetadataKey.License]: { licenseKey: string; activationKey: string; activatedAt: Date };
   [SystemMetadataKey.MaintenanceMode]: MaintenanceModeState;
-  [SystemMetadataKey.MediaLocation]: MediaLocation;
-  [SystemMetadataKey.ReverseGeocodingState]: { lastUpdate?: string; lastImportFileName?: string };
   [SystemMetadataKey.SystemConfig]: DeepPartial<SystemConfig>;
   [SystemMetadataKey.SystemFlags]: DeepPartial<SystemFlags>;
   [SystemMetadataKey.VersionCheckState]: VersionCheckMetadata;

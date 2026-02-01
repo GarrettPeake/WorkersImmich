@@ -1,0 +1,1 @@
+import{s as a}from"../chunks/B0eyFCun.js";import{a as o}from"../chunks/CJGyQpNN.js";import{L as l}from"../chunks/DKWh9q0p.js";const e=(async({url:t})=>{await o(t,{admin:!0}),await a.init()}),i=Object.freeze(Object.defineProperty({__proto__:null,load:e},Symbol.toStringTag,{value:"Module"}));export{l as component,i as universal};

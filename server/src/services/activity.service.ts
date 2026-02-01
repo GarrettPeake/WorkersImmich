@@ -1,41 +1,69 @@
-import { Injectable } from '@nestjs/common';
-import { Activity } from 'src/database';
-import {
-  ActivityCreateDto,
-  ActivityDto,
-  ActivityResponseDto,
-  ActivitySearchDto,
-  ActivityStatisticsResponseDto,
-  mapActivity,
-  MaybeDuplicate,
-  ReactionLevel,
-  ReactionType,
-} from 'src/dtos/activity.dto';
-import { AuthDto } from 'src/dtos/auth.dto';
-import { Permission } from 'src/enum';
-import { BaseService } from 'src/services/base.service';
+/**
+ * Activity service -- Workers-compatible version.
+ *
+ * Core business logic for activity CRUD operations.
+ * No NestJS decorators, no BaseService, no job queues.
+ */
 
-@Injectable()
-export class ActivityService extends BaseService {
-  async getAll(auth: AuthDto, dto: ActivitySearchDto): Promise<ActivityResponseDto[]> {
-    await this.requireAccess({ auth, permission: Permission.AlbumRead, ids: [dto.albumId] });
+import type { AuthDto } from 'src/dtos/auth.dto';
+import { Permission } from 'src/enum';
+import type { ServiceContext } from 'src/context';
+import { AccessRepository } from 'src/repositories/access.repository';
+import { ActivityRepository } from 'src/repositories/activity.repository';
+import { requireAccess } from 'src/utils/access';
+
+export class ActivityService {
+  private activityRepository: ActivityRepository;
+  private accessRepository: AccessRepository;
+
+  constructor(private ctx: ServiceContext) {
+    this.activityRepository = new ActivityRepository(ctx.db);
+    this.accessRepository = new AccessRepository(ctx.db);
+  }
+
+  async getAll(auth: AuthDto, dto: any) {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.AlbumRead,
+      ids: [dto.albumId],
+    });
+
     const activities = await this.activityRepository.search({
       userId: dto.userId,
       albumId: dto.albumId,
-      assetId: dto.level === ReactionLevel.ALBUM ? null : dto.assetId,
-      isLiked: dto.type && dto.type === ReactionType.LIKE,
+      assetId: dto.level === 'album' ? null : dto.assetId,
+      isLiked: dto.type === 'like' ? true : undefined,
     });
 
-    return activities.map((activity) => mapActivity(activity));
+    return activities.map((activity: any) => ({
+      id: activity.id,
+      createdAt: activity.createdAt,
+      type: activity.isLiked ? 'like' : 'comment',
+      comment: activity.comment,
+      user: activity.user,
+      assetId: activity.assetId,
+      albumId: activity.albumId,
+    }));
   }
 
-  async getStatistics(auth: AuthDto, dto: ActivityDto): Promise<ActivityStatisticsResponseDto> {
-    await this.requireAccess({ auth, permission: Permission.AlbumRead, ids: [dto.albumId] });
-    return await this.activityRepository.getStatistics({ albumId: dto.albumId, assetId: dto.assetId });
+  async getStatistics(auth: AuthDto, dto: any) {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.AlbumRead,
+      ids: [dto.albumId],
+    });
+    return this.activityRepository.getStatistics({
+      albumId: dto.albumId,
+      assetId: dto.assetId,
+    });
   }
 
-  async create(auth: AuthDto, dto: ActivityCreateDto): Promise<MaybeDuplicate<ActivityResponseDto>> {
-    await this.requireAccess({ auth, permission: Permission.ActivityCreate, ids: [dto.albumId] });
+  async create(auth: AuthDto, dto: any) {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.ActivityCreate,
+      ids: [dto.albumId],
+    });
 
     const common = {
       userId: auth.user.id,
@@ -43,33 +71,47 @@ export class ActivityService extends BaseService {
       albumId: dto.albumId,
     };
 
-    let activity: Activity | undefined;
+    let activity: any;
     let duplicate = false;
 
-    if (dto.type === ReactionType.LIKE) {
+    if (dto.type === 'like') {
       delete dto.comment;
-      [activity] = await this.activityRepository.search({
+      const results = await this.activityRepository.search({
         ...common,
-        // `null` will search for an album like
         assetId: dto.assetId ?? null,
         isLiked: true,
       });
+      activity = results[0];
       duplicate = !!activity;
     }
 
     if (!activity) {
       activity = await this.activityRepository.create({
         ...common,
-        isLiked: dto.type === ReactionType.LIKE,
+        isLiked: dto.type === 'like',
         comment: dto.comment,
       });
     }
 
-    return { duplicate, value: mapActivity(activity) };
+    const value = {
+      id: activity.id,
+      createdAt: activity.createdAt,
+      type: activity.isLiked ? 'like' : 'comment',
+      comment: activity.comment,
+      user: activity.user,
+      assetId: activity.assetId,
+      albumId: activity.albumId,
+    };
+
+    return { duplicate, value };
   }
 
   async delete(auth: AuthDto, id: string): Promise<void> {
-    await this.requireAccess({ auth, permission: Permission.ActivityDelete, ids: [id] });
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.ActivityDelete,
+      ids: [id],
+    });
     await this.activityRepository.delete(id);
   }
 }

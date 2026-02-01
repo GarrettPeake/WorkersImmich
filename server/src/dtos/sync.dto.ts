@@ -1,6 +1,4 @@
-/* eslint-disable @typescript-eslint/no-unsafe-function-type */
-import { ApiProperty } from '@nestjs/swagger';
-import { ArrayMaxSize, IsInt, IsPositive, IsString } from 'class-validator';
+import { z } from 'zod';
 import { AssetResponseDto } from 'src/dtos/asset-response.dto';
 import {
   AlbumUserRole,
@@ -14,446 +12,285 @@ import {
   UserMetadataKey,
 } from 'src/enum';
 import { UserMetadata } from 'src/types';
-import { ValidateBoolean, ValidateDate, ValidateEnum, ValidateUUID } from 'src/validation';
+import { optionalBooleanQuery } from 'src/validation';
 
-export class AssetFullSyncDto {
-  @ValidateUUID({ optional: true, description: 'Last asset ID (pagination)' })
-  lastId?: string;
+// --- Request Schemas ---
 
-  @ValidateDate({ description: 'Sync assets updated until this date' })
-  updatedUntil!: Date;
+export const AssetFullSyncSchema = z.object({
+  lastId: z.string().uuid().optional(),
+  updatedUntil: z.coerce.date(),
+  limit: z.number().int().positive(),
+  userId: z.string().uuid().optional(),
+});
+export type AssetFullSyncDto = z.infer<typeof AssetFullSyncSchema>;
 
-  @ApiProperty({ type: 'integer', description: 'Maximum number of assets to return' })
-  @IsInt()
-  @IsPositive()
-  limit!: number;
+export const AssetDeltaSyncSchema = z.object({
+  updatedAfter: z.coerce.date(),
+  userIds: z.array(z.string().uuid()).min(1),
+});
+export type AssetDeltaSyncDto = z.infer<typeof AssetDeltaSyncSchema>;
 
-  @ValidateUUID({ optional: true, description: 'Filter by user ID' })
-  userId?: string;
+export const SyncStreamSchema = z.object({
+  types: z.array(z.nativeEnum(SyncRequestType)).min(1),
+  reset: z.preprocess((val) => {
+    if (val === 'true' || val === true) return true;
+    if (val === 'false' || val === false) return false;
+    return val;
+  }, z.boolean().optional()),
+});
+export type SyncStreamDto = z.infer<typeof SyncStreamSchema>;
+
+export const SyncAckSchema = z.object({
+  type: z.nativeEnum(SyncEntityType),
+  ack: z.string().min(1),
+});
+export type SyncAckDto = z.infer<typeof SyncAckSchema>;
+
+export const SyncAckSetSchema = z.object({
+  acks: z.array(z.string()).max(1000).min(1),
+});
+export type SyncAckSetDto = z.infer<typeof SyncAckSetSchema>;
+
+export const SyncAckDeleteSchema = z.object({
+  types: z.array(z.nativeEnum(SyncEntityType)).optional(),
+});
+export type SyncAckDeleteDto = z.infer<typeof SyncAckDeleteSchema>;
+
+// --- Response DTOs (plain interfaces) ---
+
+export interface AssetDeltaSyncResponseDto {
+  needsFullSync: boolean;
+  upserted: AssetResponseDto[];
+  deleted: string[];
 }
 
-export class AssetDeltaSyncDto {
-  @ValidateDate({ description: 'Sync assets updated after this date' })
-  updatedAfter!: Date;
+// --- Sync Entity Types (plain interfaces, used for sync protocol responses) ---
 
-  @ValidateUUID({ each: true, description: 'User IDs to sync' })
-  userIds!: string[];
+export interface SyncUserV1 {
+  id: string;
+  name: string;
+  email: string;
+  avatarColor: UserAvatarColor | null;
+  deletedAt: Date | null;
+  hasProfileImage: boolean;
+  profileChangedAt: Date;
 }
 
-export class AssetDeltaSyncResponseDto {
-  @ApiProperty({ description: 'Whether full sync is needed' })
-  needsFullSync!: boolean;
-  @ApiProperty({ description: 'Upserted assets' })
-  upserted!: AssetResponseDto[];
-  @ApiProperty({ description: 'Deleted asset IDs' })
-  deleted!: string[];
+export interface SyncAuthUserV1 extends SyncUserV1 {
+  isAdmin: boolean;
+  pinCode: string | null;
+  oauthId: string;
+  storageLabel: string | null;
+  quotaSizeInBytes: number | null;
+  quotaUsageInBytes: number;
 }
 
-export const extraSyncModels: Function[] = [];
-
-export const ExtraModel = (): ClassDecorator => {
-  // eslint-disable-next-line unicorn/consistent-function-scoping
-  return (object: Function) => {
-    extraSyncModels.push(object);
-  };
-};
-
-@ExtraModel()
-export class SyncUserV1 {
-  @ApiProperty({ description: 'User ID' })
-  id!: string;
-  @ApiProperty({ description: 'User name' })
-  name!: string;
-  @ApiProperty({ description: 'User email' })
-  email!: string;
-  @ValidateEnum({ enum: UserAvatarColor, name: 'UserAvatarColor', description: 'User avatar color' })
-  avatarColor!: UserAvatarColor | null;
-  @ApiProperty({ description: 'User deleted at' })
-  deletedAt!: Date | null;
-  @ApiProperty({ description: 'User has profile image' })
-  hasProfileImage!: boolean;
-  @ApiProperty({ description: 'User profile changed at' })
-  profileChangedAt!: Date;
+export interface SyncUserDeleteV1 {
+  userId: string;
 }
 
-@ExtraModel()
-export class SyncAuthUserV1 extends SyncUserV1 {
-  @ApiProperty({ description: 'User is admin' })
-  isAdmin!: boolean;
-  @ApiProperty({ description: 'User pin code' })
-  pinCode!: string | null;
-  @ApiProperty({ description: 'User OAuth ID' })
-  oauthId!: string;
-  @ApiProperty({ description: 'User storage label' })
-  storageLabel!: string | null;
-  @ApiProperty({ type: 'integer' })
-  quotaSizeInBytes!: number | null;
-  @ApiProperty({ type: 'integer' })
-  quotaUsageInBytes!: number;
+export interface SyncPartnerV1 {
+  sharedById: string;
+  sharedWithId: string;
+  inTimeline: boolean;
 }
 
-@ExtraModel()
-export class SyncUserDeleteV1 {
-  @ApiProperty({ description: 'User ID' })
-  userId!: string;
+export interface SyncPartnerDeleteV1 {
+  sharedById: string;
+  sharedWithId: string;
 }
 
-@ExtraModel()
-export class SyncPartnerV1 {
-  @ApiProperty({ description: 'Shared by ID' })
-  sharedById!: string;
-  @ApiProperty({ description: 'Shared with ID' })
-  sharedWithId!: string;
-  @ApiProperty({ description: 'In timeline' })
-  inTimeline!: boolean;
+export interface SyncAssetV1 {
+  id: string;
+  ownerId: string;
+  originalFileName: string;
+  thumbhash: string | null;
+  checksum: string;
+  fileCreatedAt: Date | null;
+  fileModifiedAt: Date | null;
+  localDateTime: Date | null;
+  duration: string | null;
+  type: AssetType;
+  deletedAt: Date | null;
+  isFavorite: boolean;
+  visibility: AssetVisibility;
+  livePhotoVideoId: string | null;
+  stackId: string | null;
+  libraryId: string | null;
+  width: number | null;
+  height: number | null;
+  isEdited: boolean;
 }
 
-@ExtraModel()
-export class SyncPartnerDeleteV1 {
-  @ApiProperty({ description: 'Shared by ID' })
-  sharedById!: string;
-  @ApiProperty({ description: 'Shared with ID' })
-  sharedWithId!: string;
+export interface SyncAssetDeleteV1 {
+  assetId: string;
 }
 
-@ExtraModel()
-export class SyncAssetV1 {
-  @ApiProperty({ description: 'Asset ID' })
-  id!: string;
-  @ApiProperty({ description: 'Owner ID' })
-  ownerId!: string;
-  @ApiProperty({ description: 'Original file name' })
-  originalFileName!: string;
-  @ApiProperty({ description: 'Thumbhash' })
-  thumbhash!: string | null;
-  @ApiProperty({ description: 'Checksum' })
-  checksum!: string;
-  @ApiProperty({ description: 'File created at' })
-  fileCreatedAt!: Date | null;
-  @ApiProperty({ description: 'File modified at' })
-  fileModifiedAt!: Date | null;
-  @ApiProperty({ description: 'Local date time' })
-  localDateTime!: Date | null;
-  @ApiProperty({ description: 'Duration' })
-  duration!: string | null;
-  @ValidateEnum({ enum: AssetType, name: 'AssetTypeEnum', description: 'Asset type' })
-  type!: AssetType;
-  @ApiProperty({ description: 'Deleted at' })
-  deletedAt!: Date | null;
-  @ApiProperty({ description: 'Is favorite' })
-  isFavorite!: boolean;
-  @ValidateEnum({ enum: AssetVisibility, name: 'AssetVisibility', description: 'Asset visibility' })
-  visibility!: AssetVisibility;
-  @ApiProperty({ description: 'Live photo video ID' })
-  livePhotoVideoId!: string | null;
-  @ApiProperty({ description: 'Stack ID' })
-  stackId!: string | null;
-  @ApiProperty({ description: 'Library ID' })
-  libraryId!: string | null;
-  @ApiProperty({ type: 'integer', description: 'Asset width' })
-  width!: number | null;
-  @ApiProperty({ type: 'integer', description: 'Asset height' })
-  height!: number | null;
-  @ApiProperty({ description: 'Is edited' })
-  isEdited!: boolean;
+export interface SyncAssetExifV1 {
+  assetId: string;
+  description: string | null;
+  exifImageWidth: number | null;
+  exifImageHeight: number | null;
+  fileSizeInByte: number | null;
+  orientation: string | null;
+  dateTimeOriginal: Date | null;
+  modifyDate: Date | null;
+  timeZone: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  projectionType: string | null;
+  city: string | null;
+  state: string | null;
+  country: string | null;
+  make: string | null;
+  model: string | null;
+  lensModel: string | null;
+  fNumber: number | null;
+  focalLength: number | null;
+  iso: number | null;
+  exposureTime: string | null;
+  profileDescription: string | null;
+  rating: number | null;
+  fps: number | null;
 }
 
-@ExtraModel()
-export class SyncAssetDeleteV1 {
-  @ApiProperty({ description: 'Asset ID' })
-  assetId!: string;
+export interface SyncAssetMetadataV1 {
+  assetId: string;
+  key: string;
+  value: object;
 }
 
-@ExtraModel()
-export class SyncAssetExifV1 {
-  @ApiProperty({ description: 'Asset ID' })
-  assetId!: string;
-  @ApiProperty({ description: 'Description' })
-  description!: string | null;
-  @ApiProperty({ type: 'integer', description: 'Exif image width' })
-  exifImageWidth!: number | null;
-  @ApiProperty({ type: 'integer', description: 'Exif image height' })
-  exifImageHeight!: number | null;
-  @ApiProperty({ type: 'integer', description: 'File size in byte' })
-  fileSizeInByte!: number | null;
-  @ApiProperty({ description: 'Orientation' })
-  orientation!: string | null;
-  @ApiProperty({ description: 'Date time original' })
-  dateTimeOriginal!: Date | null;
-  @ApiProperty({ description: 'Modify date' })
-  modifyDate!: Date | null;
-  @ApiProperty({ description: 'Time zone' })
-  timeZone!: string | null;
-  @ApiProperty({ type: 'number', format: 'double', description: 'Latitude' })
-  latitude!: number | null;
-  @ApiProperty({ type: 'number', format: 'double', description: 'Longitude' })
-  longitude!: number | null;
-  @ApiProperty({ description: 'Projection type' })
-  projectionType!: string | null;
-  @ApiProperty({ description: 'City' })
-  city!: string | null;
-  @ApiProperty({ description: 'State' })
-  state!: string | null;
-  @ApiProperty({ description: 'Country' })
-  country!: string | null;
-  @ApiProperty({ description: 'Make' })
-  make!: string | null;
-  @ApiProperty({ description: 'Model' })
-  model!: string | null;
-  @ApiProperty({ description: 'Lens model' })
-  lensModel!: string | null;
-  @ApiProperty({ type: 'number', format: 'double', description: 'F number' })
-  fNumber!: number | null;
-  @ApiProperty({ type: 'number', format: 'double', description: 'Focal length' })
-  focalLength!: number | null;
-  @ApiProperty({ type: 'integer', description: 'ISO' })
-  iso!: number | null;
-  @ApiProperty({ description: 'Exposure time' })
-  exposureTime!: string | null;
-  @ApiProperty({ description: 'Profile description' })
-  profileDescription!: string | null;
-  @ApiProperty({ type: 'integer', description: 'Rating' })
-  rating!: number | null;
-  @ApiProperty({ type: 'number', format: 'double', description: 'FPS' })
-  fps!: number | null;
+export interface SyncAssetMetadataDeleteV1 {
+  assetId: string;
+  key: string;
 }
 
-@ExtraModel()
-export class SyncAssetMetadataV1 {
-  @ApiProperty({ description: 'Asset ID' })
-  assetId!: string;
-  @ApiProperty({ description: 'Key' })
-  key!: string;
-  @ApiProperty({ description: 'Value' })
-  value!: object;
+export interface SyncAlbumDeleteV1 {
+  albumId: string;
 }
 
-@ExtraModel()
-export class SyncAssetMetadataDeleteV1 {
-  @ApiProperty({ description: 'Asset ID' })
-  assetId!: string;
-  @ApiProperty({ description: 'Key' })
-  key!: string;
+export interface SyncAlbumUserDeleteV1 {
+  albumId: string;
+  userId: string;
 }
 
-@ExtraModel()
-export class SyncAlbumDeleteV1 {
-  @ApiProperty({ description: 'Album ID' })
-  albumId!: string;
+export interface SyncAlbumUserV1 {
+  albumId: string;
+  userId: string;
+  role: AlbumUserRole;
 }
 
-@ExtraModel()
-export class SyncAlbumUserDeleteV1 {
-  @ApiProperty({ description: 'Album ID' })
-  albumId!: string;
-  @ApiProperty({ description: 'User ID' })
-  userId!: string;
+export interface SyncAlbumV1 {
+  id: string;
+  ownerId: string;
+  name: string;
+  description: string;
+  createdAt: Date;
+  updatedAt: Date;
+  thumbnailAssetId: string | null;
+  isActivityEnabled: boolean;
+  order: AssetOrder;
 }
 
-@ExtraModel()
-export class SyncAlbumUserV1 {
-  @ApiProperty({ description: 'Album ID' })
-  albumId!: string;
-  @ApiProperty({ description: 'User ID' })
-  userId!: string;
-  @ValidateEnum({ enum: AlbumUserRole, name: 'AlbumUserRole', description: 'Album user role' })
-  role!: AlbumUserRole;
+export interface SyncAlbumToAssetV1 {
+  albumId: string;
+  assetId: string;
 }
 
-@ExtraModel()
-export class SyncAlbumV1 {
-  @ApiProperty({ description: 'Album ID' })
-  id!: string;
-  @ApiProperty({ description: 'Owner ID' })
-  ownerId!: string;
-  @ApiProperty({ description: 'Album name' })
-  name!: string;
-  @ApiProperty({ description: 'Album description' })
-  description!: string;
-  @ApiProperty({ description: 'Created at' })
-  createdAt!: Date;
-  @ApiProperty({ description: 'Updated at' })
-  updatedAt!: Date;
-  @ApiProperty({ description: 'Thumbnail asset ID' })
-  thumbnailAssetId!: string | null;
-  @ApiProperty({ description: 'Is activity enabled' })
-  isActivityEnabled!: boolean;
-  @ValidateEnum({ enum: AssetOrder, name: 'AssetOrder' })
-  order!: AssetOrder;
+export interface SyncAlbumToAssetDeleteV1 {
+  albumId: string;
+  assetId: string;
 }
 
-@ExtraModel()
-export class SyncAlbumToAssetV1 {
-  @ApiProperty({ description: 'Album ID' })
-  albumId!: string;
-  @ApiProperty({ description: 'Asset ID' })
-  assetId!: string;
+export interface SyncMemoryV1 {
+  id: string;
+  createdAt: Date;
+  updatedAt: Date;
+  deletedAt: Date | null;
+  ownerId: string;
+  type: MemoryType;
+  data: object;
+  isSaved: boolean;
+  memoryAt: Date;
+  seenAt: Date | null;
+  showAt: Date | null;
+  hideAt: Date | null;
 }
 
-@ExtraModel()
-export class SyncAlbumToAssetDeleteV1 {
-  @ApiProperty({ description: 'Album ID' })
-  albumId!: string;
-  @ApiProperty({ description: 'Asset ID' })
-  assetId!: string;
+export interface SyncMemoryDeleteV1 {
+  memoryId: string;
 }
 
-@ExtraModel()
-export class SyncMemoryV1 {
-  @ApiProperty({ description: 'Memory ID' })
-  id!: string;
-  @ApiProperty({ description: 'Created at' })
-  createdAt!: Date;
-  @ApiProperty({ description: 'Updated at' })
-  updatedAt!: Date;
-  @ApiProperty({ description: 'Deleted at' })
-  deletedAt!: Date | null;
-  @ApiProperty({ description: 'Owner ID' })
-  ownerId!: string;
-  @ValidateEnum({ enum: MemoryType, name: 'MemoryType', description: 'Memory type' })
-  type!: MemoryType;
-  @ApiProperty({ description: 'Data' })
-  data!: object;
-  @ApiProperty({ description: 'Is saved' })
-  isSaved!: boolean;
-  @ApiProperty({ description: 'Memory at' })
-  memoryAt!: Date;
-  @ApiProperty({ description: 'Seen at' })
-  seenAt!: Date | null;
-  @ApiProperty({ description: 'Show at' })
-  showAt!: Date | null;
-  @ApiProperty({ description: 'Hide at' })
-  hideAt!: Date | null;
+export interface SyncMemoryAssetV1 {
+  memoryId: string;
+  assetId: string;
 }
 
-@ExtraModel()
-export class SyncMemoryDeleteV1 {
-  @ApiProperty({ description: 'Memory ID' })
-  memoryId!: string;
+export interface SyncMemoryAssetDeleteV1 {
+  memoryId: string;
+  assetId: string;
 }
 
-@ExtraModel()
-export class SyncMemoryAssetV1 {
-  @ApiProperty({ description: 'Memory ID' })
-  memoryId!: string;
-  @ApiProperty({ description: 'Asset ID' })
-  assetId!: string;
+export interface SyncStackV1 {
+  id: string;
+  createdAt: Date;
+  updatedAt: Date;
+  primaryAssetId: string;
+  ownerId: string;
 }
 
-@ExtraModel()
-export class SyncMemoryAssetDeleteV1 {
-  @ApiProperty({ description: 'Memory ID' })
-  memoryId!: string;
-  @ApiProperty({ description: 'Asset ID' })
-  assetId!: string;
+export interface SyncStackDeleteV1 {
+  stackId: string;
 }
 
-@ExtraModel()
-export class SyncStackV1 {
-  @ApiProperty({ description: 'Stack ID' })
-  id!: string;
-  @ApiProperty({ description: 'Created at' })
-  createdAt!: Date;
-  @ApiProperty({ description: 'Updated at' })
-  updatedAt!: Date;
-  @ApiProperty({ description: 'Primary asset ID' })
-  primaryAssetId!: string;
-  @ApiProperty({ description: 'Owner ID' })
-  ownerId!: string;
+export interface SyncPersonV1 {
+  id: string;
+  createdAt: Date;
+  updatedAt: Date;
+  ownerId: string;
+  name: string;
+  birthDate: Date | null;
+  isHidden: boolean;
+  isFavorite: boolean;
+  color: string | null;
+  faceAssetId: string | null;
 }
 
-@ExtraModel()
-export class SyncStackDeleteV1 {
-  @ApiProperty({ description: 'Stack ID' })
-  stackId!: string;
+export interface SyncPersonDeleteV1 {
+  personId: string;
 }
 
-@ExtraModel()
-export class SyncPersonV1 {
-  @ApiProperty({ description: 'Person ID' })
-  id!: string;
-  @ApiProperty({ description: 'Created at' })
-  createdAt!: Date;
-  @ApiProperty({ description: 'Updated at' })
-  updatedAt!: Date;
-  @ApiProperty({ description: 'Owner ID' })
-  ownerId!: string;
-  @ApiProperty({ description: 'Person name' })
-  name!: string;
-  @ApiProperty({ description: 'Birth date' })
-  birthDate!: Date | null;
-  @ApiProperty({ description: 'Is hidden' })
-  isHidden!: boolean;
-  @ApiProperty({ description: 'Is favorite' })
-  isFavorite!: boolean;
-  @ApiProperty({ description: 'Color' })
-  color!: string | null;
-  @ApiProperty({ description: 'Face asset ID' })
-  faceAssetId!: string | null;
+export interface SyncAssetFaceV1 {
+  id: string;
+  assetId: string;
+  personId: string | null;
+  imageWidth: number;
+  imageHeight: number;
+  boundingBoxX1: number;
+  boundingBoxY1: number;
+  boundingBoxX2: number;
+  boundingBoxY2: number;
+  sourceType: string;
 }
 
-@ExtraModel()
-export class SyncPersonDeleteV1 {
-  @ApiProperty({ description: 'Person ID' })
-  personId!: string;
+export interface SyncAssetFaceDeleteV1 {
+  assetFaceId: string;
 }
 
-@ExtraModel()
-export class SyncAssetFaceV1 {
-  @ApiProperty({ description: 'Asset face ID' })
-  id!: string;
-  @ApiProperty({ description: 'Asset ID' })
-  assetId!: string;
-  @ApiProperty({ description: 'Person ID' })
-  personId!: string | null;
-  @ApiProperty({ type: 'integer' })
-  imageWidth!: number;
-  @ApiProperty({ type: 'integer' })
-  imageHeight!: number;
-  @ApiProperty({ type: 'integer' })
-  boundingBoxX1!: number;
-  @ApiProperty({ type: 'integer' })
-  boundingBoxY1!: number;
-  @ApiProperty({ type: 'integer' })
-  boundingBoxX2!: number;
-  @ApiProperty({ type: 'integer' })
-  boundingBoxY2!: number;
-  @ApiProperty({ description: 'Source type' })
-  sourceType!: string;
+export interface SyncUserMetadataV1 {
+  userId: string;
+  key: UserMetadataKey;
+  value: UserMetadata[UserMetadataKey];
 }
 
-@ExtraModel()
-export class SyncAssetFaceDeleteV1 {
-  @ApiProperty({ description: 'Asset face ID' })
-  assetFaceId!: string;
+export interface SyncUserMetadataDeleteV1 {
+  userId: string;
+  key: UserMetadataKey;
 }
 
-@ExtraModel()
-export class SyncUserMetadataV1 {
-  @ApiProperty({ description: 'User ID' })
-  userId!: string;
-  @ValidateEnum({ enum: UserMetadataKey, name: 'UserMetadataKey', description: 'User metadata key' })
-  key!: UserMetadataKey;
-  @ApiProperty({ description: 'User metadata value' })
-  value!: UserMetadata[UserMetadataKey];
-}
-
-@ExtraModel()
-export class SyncUserMetadataDeleteV1 {
-  @ApiProperty({ description: 'User ID' })
-  userId!: string;
-  @ValidateEnum({ enum: UserMetadataKey, name: 'UserMetadataKey', description: 'User metadata key' })
-  key!: UserMetadataKey;
-}
-
-@ExtraModel()
-export class SyncAckV1 {}
-
-@ExtraModel()
-export class SyncResetV1 {}
-
-@ExtraModel()
-export class SyncCompleteV1 {}
+export interface SyncAckV1 {}
+export interface SyncResetV1 {}
+export interface SyncCompleteV1 {}
 
 export type SyncItem = {
   [SyncEntityType.AuthUserV1]: SyncAuthUserV1;
@@ -504,36 +341,3 @@ export type SyncItem = {
   [SyncEntityType.SyncCompleteV1]: SyncCompleteV1;
   [SyncEntityType.SyncResetV1]: SyncResetV1;
 };
-
-export class SyncStreamDto {
-  @ValidateEnum({ enum: SyncRequestType, name: 'SyncRequestType', each: true, description: 'Sync request types' })
-  types!: SyncRequestType[];
-
-  @ValidateBoolean({ optional: true, description: 'Reset sync state' })
-  reset?: boolean;
-}
-
-export class SyncAckDto {
-  @ValidateEnum({ enum: SyncEntityType, name: 'SyncEntityType', description: 'Sync entity type' })
-  type!: SyncEntityType;
-  @ApiProperty({ description: 'Acknowledgment ID' })
-  ack!: string;
-}
-
-export class SyncAckSetDto {
-  @ApiProperty({ description: 'Acknowledgment IDs (max 1000)' })
-  @ArrayMaxSize(1000)
-  @IsString({ each: true })
-  acks!: string[];
-}
-
-export class SyncAckDeleteDto {
-  @ValidateEnum({
-    enum: SyncEntityType,
-    name: 'SyncEntityType',
-    optional: true,
-    each: true,
-    description: 'Sync entity types to delete acks for',
-  })
-  types?: SyncEntityType[];
-}

@@ -3,7 +3,34 @@ import { UserPreferencesUpdateDto } from 'src/dtos/user-preferences.dto';
 import { AssetOrder, UserMetadataKey } from 'src/enum';
 import { DeepPartial, UserMetadataItem, UserPreferences } from 'src/types';
 import { HumanReadableSize } from 'src/utils/bytes';
-import { getKeysDeep } from 'src/utils/misc';
+
+/**
+ * Returns a list of strings representing the keys of the object in dot notation.
+ * Inlined from misc.ts to avoid pulling in NestJS/Swagger dependencies.
+ */
+const getKeysDeep = (target: unknown, path: string[] = []): string[] => {
+  if (!target || typeof target !== 'object') {
+    return [];
+  }
+
+  const obj = target as object;
+  const properties: string[] = [];
+  for (const key of Object.keys(obj)) {
+    const value = obj[key as keyof object];
+    if (value === undefined) {
+      continue;
+    }
+
+    if (_.isObject(value) && !_.isArray(value) && !_.isDate(value)) {
+      properties.push(...getKeysDeep(value, [...path, key]));
+      continue;
+    }
+
+    properties.push([...path, key].join('.'));
+  }
+
+  return properties;
+};
 
 const getDefaultPreferences = (): UserPreferences => {
   return {

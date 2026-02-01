@@ -1,157 +1,152 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
-import { DateTime } from 'luxon';
-import { OnJob } from 'src/decorators';
-import { BulkIdResponseDto, BulkIdsDto } from 'src/dtos/asset-ids.response.dto';
-import { AuthDto } from 'src/dtos/auth.dto';
-import { MemoryCreateDto, MemoryResponseDto, MemorySearchDto, MemoryUpdateDto, mapMemory } from 'src/dtos/memory.dto';
-import { DatabaseLock, JobName, MemoryType, Permission, QueueName, SystemMetadataKey } from 'src/enum';
-import { BaseService } from 'src/services/base.service';
-import { addAssets, removeAssets } from 'src/utils/asset.util';
+/**
+ * Memory service -- Workers-compatible version.
+ *
+ * Core business logic for memory CRUD operations.
+ * No NestJS decorators, no BaseService, no job queues.
+ */
 
-const DAYS = 3;
+import type { AuthDto } from 'src/dtos/auth.dto';
+import { Permission } from 'src/enum';
+import type { ServiceContext } from 'src/context';
+import { AccessRepository } from 'src/repositories/access.repository';
+import { MemoryRepository } from 'src/repositories/memory.repository';
+import { requireAccess, checkAccess } from 'src/utils/access';
 
-@Injectable()
-export class MemoryService extends BaseService {
-  @OnJob({ name: JobName.MemoryGenerate, queue: QueueName.BackgroundTask })
-  async onMemoriesCreate() {
-    const users = await this.userRepository.getList({ withDeleted: false });
+export class MemoryService {
+  private memoryRepository: MemoryRepository;
+  private accessRepository: AccessRepository;
 
-    await this.databaseRepository.withLock(DatabaseLock.MemoryCreation, async () => {
-      const state = await this.systemMetadataRepository.get(SystemMetadataKey.MemoriesState);
-      const start = DateTime.utc().startOf('day').minus({ days: DAYS });
-      const lastOnThisDayDate = state?.lastOnThisDayDate ? DateTime.fromISO(state.lastOnThisDayDate) : start;
-
-      // generate a memory +/- X days from today
-      for (let i = 0; i <= DAYS * 2; i++) {
-        const target = start.plus({ days: i });
-        if (lastOnThisDayDate >= target) {
-          continue;
-        }
-
-        this.logger.log(`Creating memories for ${target.toISO()}`);
-        try {
-          await Promise.all(users.map((owner) => this.createOnThisDayMemories(owner.id, target)));
-        } catch (error) {
-          this.logger.error(`Failed to create memories for ${target.toISO()}: ${error}`);
-        }
-        // update system metadata even when there is an error to minimize the chance of duplicates
-        await this.systemMetadataRepository.set(SystemMetadataKey.MemoriesState, {
-          ...state,
-          lastOnThisDayDate: target.toISO(),
-        });
-      }
-    });
+  constructor(private ctx: ServiceContext) {
+    this.memoryRepository = new MemoryRepository(ctx.db);
+    this.accessRepository = new AccessRepository(ctx.db);
   }
 
-  private async createOnThisDayMemories(ownerId: string, target: DateTime) {
-    const showAt = target.startOf('day').toISO();
-    const hideAt = target.endOf('day').toISO();
-    const memories = await this.assetRepository.getByDayOfYear([ownerId], target);
-    await Promise.all(
-      memories.map(({ year, assets }) =>
-        this.memoryRepository.create(
-          {
-            ownerId,
-            type: MemoryType.OnThisDay,
-            data: { year },
-            memoryAt: target.set({ year }).toISO()!,
-            showAt,
-            hideAt,
-          },
-          new Set(assets.map(({ id }) => id)),
-        ),
-      ),
-    );
-  }
-
-  @OnJob({ name: JobName.MemoryCleanup, queue: QueueName.BackgroundTask })
-  async onMemoriesCleanup() {
-    await this.memoryRepository.cleanup();
-  }
-
-  async search(auth: AuthDto, dto: MemorySearchDto) {
+  async search(auth: AuthDto, dto: any) {
     const memories = await this.memoryRepository.search(auth.user.id, dto);
-    return memories.map((memory) => mapMemory(memory, auth));
+    return memories;
   }
 
-  statistics(auth: AuthDto, dto: MemorySearchDto) {
+  statistics(auth: AuthDto, dto: any) {
     return this.memoryRepository.statistics(auth.user.id, dto);
   }
 
-  async get(auth: AuthDto, id: string): Promise<MemoryResponseDto> {
-    await this.requireAccess({ auth, permission: Permission.MemoryRead, ids: [id] });
+  async get(auth: AuthDto, id: string) {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.MemoryRead,
+      ids: [id],
+    });
     const memory = await this.findOrFail(id);
-    return mapMemory(memory, auth);
+    return memory;
   }
 
-  async create(auth: AuthDto, dto: MemoryCreateDto) {
-    // TODO validate type/data combination
-
+  async create(auth: AuthDto, dto: any) {
     const assetIds = dto.assetIds || [];
-    const allowedAssetIds = await this.checkAccess({
+    const allowedAssetIds = await checkAccess(this.accessRepository, {
       auth,
       permission: Permission.AssetShare,
       ids: assetIds,
     });
+
     const memory = await this.memoryRepository.create(
       {
         ownerId: auth.user.id,
         type: dto.type,
-        data: dto.data,
-        isSaved: dto.isSaved,
+        data: JSON.stringify(dto.data || {}),
+        isSaved: dto.isSaved ? 1 : 0,
         memoryAt: dto.memoryAt,
         seenAt: dto.seenAt,
       },
       allowedAssetIds,
     );
 
-    return mapMemory(memory, auth);
+    return memory;
   }
 
-  async update(auth: AuthDto, id: string, dto: MemoryUpdateDto): Promise<MemoryResponseDto> {
-    await this.requireAccess({ auth, permission: Permission.MemoryUpdate, ids: [id] });
+  async update(auth: AuthDto, id: string, dto: any) {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.MemoryUpdate,
+      ids: [id],
+    });
 
     const memory = await this.memoryRepository.update(id, {
-      isSaved: dto.isSaved,
+      isSaved: dto.isSaved !== undefined ? (dto.isSaved ? 1 : 0) : undefined,
       memoryAt: dto.memoryAt,
       seenAt: dto.seenAt,
     });
 
-    return mapMemory(memory, auth);
+    return memory;
   }
 
   async remove(auth: AuthDto, id: string): Promise<void> {
-    await this.requireAccess({ auth, permission: Permission.MemoryDelete, ids: [id] });
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.MemoryDelete,
+      ids: [id],
+    });
     await this.memoryRepository.delete(id);
   }
 
-  async addAssets(auth: AuthDto, id: string, dto: BulkIdsDto): Promise<BulkIdResponseDto[]> {
-    await this.requireAccess({ auth, permission: Permission.MemoryRead, ids: [id] });
+  async addAssets(auth: AuthDto, id: string, dto: { ids: string[] }) {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.MemoryRead,
+      ids: [id],
+    });
 
-    const repos = { access: this.accessRepository, bulk: this.memoryRepository };
-    const results = await addAssets(auth, repos, { parentId: id, assetIds: dto.ids });
+    const allowedAssetIds = await checkAccess(this.accessRepository, {
+      auth,
+      permission: Permission.AssetShare,
+      ids: dto.ids,
+    });
 
-    const hasSuccess = results.find(({ success }) => success);
-    if (hasSuccess) {
-      await this.memoryRepository.update(id, { updatedAt: new Date() });
+    const existingAssetIds = await this.memoryRepository.getAssetIds(id, dto.ids);
+    const results: Array<{ id: string; success: boolean; error?: string }> = [];
+    const toAdd: string[] = [];
+
+    for (const assetId of dto.ids) {
+      if (existingAssetIds.has(assetId)) {
+        results.push({ id: assetId, success: false, error: 'duplicate' });
+      } else if (!allowedAssetIds.has(assetId)) {
+        results.push({ id: assetId, success: false, error: 'no_permission' });
+      } else {
+        results.push({ id: assetId, success: true });
+        toAdd.push(assetId);
+      }
+    }
+
+    if (toAdd.length > 0) {
+      await this.memoryRepository.addAssetIds(id, toAdd);
+      await this.memoryRepository.update(id, { updatedAt: new Date().toISOString() });
     }
 
     return results;
   }
 
-  async removeAssets(auth: AuthDto, id: string, dto: BulkIdsDto): Promise<BulkIdResponseDto[]> {
-    await this.requireAccess({ auth, permission: Permission.MemoryUpdate, ids: [id] });
-
-    const repos = { access: this.accessRepository, bulk: this.memoryRepository };
-    const results = await removeAssets(auth, repos, {
-      parentId: id,
-      assetIds: dto.ids,
-      canAlwaysRemove: Permission.MemoryDelete,
+  async removeAssets(auth: AuthDto, id: string, dto: { ids: string[] }) {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.MemoryUpdate,
+      ids: [id],
     });
 
-    const hasSuccess = results.find(({ success }) => success);
-    if (hasSuccess) {
-      await this.memoryRepository.update(id, { id, updatedAt: new Date() });
+    const existingAssetIds = await this.memoryRepository.getAssetIds(id, dto.ids);
+    const results: Array<{ id: string; success: boolean; error?: string }> = [];
+    const toRemove: string[] = [];
+
+    for (const assetId of dto.ids) {
+      if (!existingAssetIds.has(assetId)) {
+        results.push({ id: assetId, success: false, error: 'not_found' });
+      } else {
+        results.push({ id: assetId, success: true });
+        toRemove.push(assetId);
+      }
+    }
+
+    if (toRemove.length > 0) {
+      await this.memoryRepository.removeAssetIds(id, toRemove);
+      await this.memoryRepository.update(id, { updatedAt: new Date().toISOString() });
     }
 
     return results;
@@ -160,7 +155,7 @@ export class MemoryService extends BaseService {
   private async findOrFail(id: string) {
     const memory = await this.memoryRepository.get(id);
     if (!memory) {
-      throw new BadRequestException('Memory not found');
+      throw new Error('Memory not found');
     }
     return memory;
   }

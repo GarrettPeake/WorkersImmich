@@ -1,8 +1,14 @@
-import { BadRequestException, Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
-import { extname } from 'node:path';
-import sanitize from 'sanitize-filename';
+/**
+ * Asset media service — Workers-compatible version.
+ *
+ * Handles upload, download, thumbnail viewing, video playback, and
+ * duplicate checking for asset media files.
+ *
+ * No NestJS decorators, no BaseService, no node: imports, no Express.
+ * Uses R2 for storage, crypto.subtle for checksums.
+ */
+
 import { StorageCore } from 'src/cores/storage.core';
-import { Asset } from 'src/database';
 import {
   AssetBulkUploadCheckResponseDto,
   AssetMediaResponseDto,
@@ -18,183 +24,344 @@ import {
   AssetMediaReplaceDto,
   AssetMediaSize,
   CheckExistingAssetsDto,
-  UploadFieldName,
 } from 'src/dtos/asset-media.dto';
 import { AssetDownloadOriginalDto } from 'src/dtos/asset.dto';
-import { AuthDto } from 'src/dtos/auth.dto';
+import type { AuthDto } from 'src/dtos/auth.dto';
 import {
   AssetFileType,
   AssetStatus,
   AssetVisibility,
-  CacheControl,
-  JobName,
   Permission,
-  StorageFolder,
 } from 'src/enum';
-import { AuthRequest } from 'src/middleware/auth.guard';
-import { BaseService } from 'src/services/base.service';
-import { UploadFile, UploadRequest } from 'src/types';
-import { requireUploadAccess } from 'src/utils/access';
-import { asUploadRequest, onBeforeLink } from 'src/utils/asset.util';
-import { isAssetChecksumConstraint } from 'src/utils/database';
-import { getFilenameExtension, getFileNameWithoutExtension, ImmichFileResponse } from 'src/utils/file';
+import type { ServiceContext } from 'src/context';
+import { AssetRepository } from 'src/repositories/asset.repository';
+import { AccessRepository } from 'src/repositories/access.repository';
+import { StorageRepository } from 'src/repositories/storage.repository';
+import { MediaRepository } from 'src/repositories/media.repository';
+import { requireAccess, requireUploadAccess } from 'src/utils/access';
+import { extname } from 'src/utils/path';
 import { mimeTypes } from 'src/utils/mime-types';
-import { fromChecksum } from 'src/utils/request';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 export interface AssetMediaRedirectResponse {
   targetSize: AssetMediaSize | 'original';
 }
 
-@Injectable()
-export class AssetMediaService extends BaseService {
-  async getUploadAssetIdByChecksum(auth: AuthDto, checksum?: string): Promise<AssetMediaResponseDto | undefined> {
-    if (!checksum) {
-      return;
-    }
+/**
+ * Represents an uploaded file in the Workers environment.
+ * File data comes from Hono's parseBody() as a File (web standard).
+ */
+export interface WorkerUploadFile {
+  /** The file data as an ArrayBuffer */
+  data: ArrayBuffer;
+  /** Original filename */
+  originalName: string;
+  /** File size in bytes */
+  size: number;
+  /** SHA-1 checksum as Uint8Array */
+  checksum: Uint8Array;
+  /** Content type */
+  contentType: string;
+  /** R2 key where the file is stored */
+  r2Key: string;
+}
 
-    const assetId = await this.assetRepository.getUploadAssetIdByChecksum(auth.user.id, fromChecksum(checksum));
-    if (!assetId) {
-      return;
-    }
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-    return { id: assetId, status: AssetMediaStatus.DUPLICATE };
+/** Compute SHA-1 hash of an ArrayBuffer. Returns Uint8Array. */
+async function computeSha1(data: ArrayBuffer): Promise<Uint8Array> {
+  const hashBuffer = await crypto.subtle.digest('SHA-1', data);
+  return new Uint8Array(hashBuffer);
+}
+
+/** Convert Uint8Array to hex string. */
+function uint8ArrayToHex(arr: Uint8Array): string {
+  return Array.from(arr)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+/** Convert hex string to Uint8Array. */
+function hexToUint8Array(hex: string): Uint8Array {
+  // Handle '\\x' prefix from PostgreSQL-style hex
+  const clean = hex.startsWith('\\x') ? hex.slice(2) : hex;
+  const bytes = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < clean.length; i += 2) {
+    bytes[i / 2] = Number.parseInt(clean.slice(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+/** Convert base64 checksum to Uint8Array. */
+function fromChecksum(checksum: string): Uint8Array {
+  // If it looks like hex
+  if (/^[0-9a-f]+$/i.test(checksum) && checksum.length === 40) {
+    return hexToUint8Array(checksum);
+  }
+  // Otherwise treat as base64
+  const binaryString = atob(checksum);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function getFileNameWithoutExtension(filename: string): string {
+  const ext = extname(filename);
+  return ext ? filename.slice(0, -ext.length) : filename;
+}
+
+function getFilenameExtension(path: string): string {
+  return extname(path);
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+export class AssetMediaService {
+  private assetRepository: AssetRepository;
+  private accessRepository: AccessRepository;
+  private storageRepository: StorageRepository;
+  private mediaRepository: MediaRepository;
+
+  constructor(private ctx: ServiceContext) {
+    this.assetRepository = new AssetRepository(ctx.db);
+    this.accessRepository = new AccessRepository(ctx.db);
+    this.storageRepository = new StorageRepository(ctx.bucket);
+    this.mediaRepository = new MediaRepository(
+      ctx.bucket,
+      '', // Image Resizing URL -- empty means fallback to original in dev/test
+    );
   }
 
-  canUploadFile({ auth, fieldName, file, body }: UploadRequest): true {
-    requireUploadAccess(auth);
-
-    const filename = body.filename || file.originalName;
-
-    switch (fieldName) {
-      case UploadFieldName.ASSET_DATA: {
-        if (mimeTypes.isAsset(filename)) {
-          return true;
-        }
-        break;
-      }
-
-      case UploadFieldName.SIDECAR_DATA: {
-        if (mimeTypes.isSidecar(filename)) {
-          return true;
-        }
-        break;
-      }
-
-      case UploadFieldName.PROFILE_DATA: {
-        if (mimeTypes.isProfile(filename)) {
-          return true;
-        }
-        break;
-      }
-    }
-
-    this.logger.error(`Unsupported file type ${filename}`);
-    throw new BadRequestException(`Unsupported file type ${filename}`);
-  }
-
-  getUploadFilename({ auth, fieldName, file, body }: UploadRequest): string {
-    requireUploadAccess(auth);
-
-    const extension = extname(body.filename || file.originalName);
-
-    const lookup = {
-      [UploadFieldName.ASSET_DATA]: extension,
-      [UploadFieldName.SIDECAR_DATA]: '.xmp',
-      [UploadFieldName.PROFILE_DATA]: extension,
-    };
-
-    return sanitize(`${file.uuid}${lookup[fieldName]}`);
-  }
-
-  getUploadFolder({ auth, fieldName, file }: UploadRequest): string {
-    auth = requireUploadAccess(auth);
-
-    let folder = StorageCore.getNestedFolder(StorageFolder.Upload, auth.user.id, file.uuid);
-    if (fieldName === UploadFieldName.PROFILE_DATA) {
-      folder = StorageCore.getFolderLocation(StorageFolder.Profile, auth.user.id);
-    }
-
-    this.storageRepository.mkdirSync(folder);
-
-    return folder;
-  }
-
-  async onUploadError(request: AuthRequest, file: Express.Multer.File) {
-    const uploadFilename = this.getUploadFilename(asUploadRequest(request, file));
-    const uploadFolder = this.getUploadFolder(asUploadRequest(request, file));
-    const uploadPath = `${uploadFolder}/${uploadFilename}`;
-
-    await this.jobRepository.queue({ name: JobName.FileDelete, data: { files: [uploadPath] } });
-  }
+  // -------------------------------------------------------------------------
+  // Upload
+  // -------------------------------------------------------------------------
 
   async uploadAsset(
     auth: AuthDto,
     dto: AssetMediaCreateDto,
-    file: UploadFile,
-    sidecarFile?: UploadFile,
+    fileData: ArrayBuffer,
+    originalName: string,
+    sidecarData?: ArrayBuffer,
+    sidecarName?: string,
   ): Promise<AssetMediaResponseDto> {
     try {
-      await this.requireAccess({
-        auth,
-        permission: Permission.AssetUpload,
-        // do not need an id here, but the interface requires it
-        ids: [auth.user.id],
+      requireUploadAccess(auth);
+
+      const fileSize = fileData.byteLength;
+      this.requireQuota(auth, fileSize);
+
+      // Compute checksum
+      const checksum = await computeSha1(fileData);
+
+      // Check for duplicates
+      const existingId = await this.assetRepository.getUploadAssetIdByChecksum(auth.user.id, checksum);
+      if (existingId) {
+        return { id: existingId, status: AssetMediaStatus.DUPLICATE };
+      }
+
+      // Generate asset ID and determine extension
+      const assetId = crypto.randomUUID();
+      const ext = extname(dto.filename || originalName);
+      const r2Key = StorageCore.getAssetOriginalKey(auth.user.id, assetId, ext);
+
+      // Upload original to R2
+      const contentType = mimeTypes.lookup(originalName) || 'application/octet-stream';
+      await this.storageRepository.writeFile(r2Key, fileData, { contentType });
+
+      // Create asset record in D1
+      const asset = await this.assetRepository.create({
+        id: assetId,
+        ownerId: auth.user.id,
+        libraryId: null,
+        checksum,
+        originalPath: r2Key,
+        deviceAssetId: dto.deviceAssetId,
+        deviceId: dto.deviceId,
+        fileCreatedAt: dto.fileCreatedAt ? new Date(dto.fileCreatedAt).toISOString() : new Date().toISOString(),
+        fileModifiedAt: dto.fileModifiedAt ? new Date(dto.fileModifiedAt).toISOString() : new Date().toISOString(),
+        localDateTime: dto.fileCreatedAt ? new Date(dto.fileCreatedAt).toISOString() : new Date().toISOString(),
+        type: mimeTypes.assetType(originalName),
+        isFavorite: dto.isFavorite ? 1 : 0,
+        duration: dto.duration || null,
+        visibility: dto.visibility ?? AssetVisibility.Timeline,
+        originalFileName: dto.filename || originalName,
       });
 
-      this.requireQuota(auth, file.size);
+      // Store metadata if provided
+      if (dto.metadata?.length) {
+        await this.assetRepository.upsertMetadata(asset.id, dto.metadata);
+      }
 
-      if (dto.livePhotoVideoId) {
-        await onBeforeLink(
-          { asset: this.assetRepository, event: this.eventRepository },
-          { userId: auth.user.id, livePhotoVideoId: dto.livePhotoVideoId },
+      // Extract EXIF and store
+      try {
+        const exifData = await this.mediaRepository.extractExif(fileData);
+        await this.assetRepository.upsertExif(
+          {
+            assetId: asset.id,
+            fileSizeInByte: fileSize,
+            ...exifData,
+          },
+          { lockedPropertiesBehavior: 'override' },
+        );
+      } catch (exifErr) {
+        // EXIF extraction failure is non-fatal — just store the file size
+        console.warn('EXIF extraction failed:', exifErr);
+        await this.assetRepository.upsertExif(
+          { assetId: asset.id, fileSizeInByte: fileSize },
+          { lockedPropertiesBehavior: 'override' },
         );
       }
-      const asset = await this.create(auth.user.id, dto, file, sidecarFile);
 
-      await this.userRepository.updateUsage(auth.user.id, file.size);
+      // Generate thumbnail and preview (non-blocking for images)
+      if (mimeTypes.isImage(originalName)) {
+        try {
+          const thumbnailKey = await this.mediaRepository.generateThumbnail(
+            auth.user.id, asset.id, r2Key,
+            { width: 250, height: 250 },
+          );
+          await this.assetRepository.upsertFile({
+            assetId: asset.id, path: thumbnailKey,
+            type: AssetFileType.Thumbnail, isEdited: 0,
+          });
+
+          const previewKey = await this.mediaRepository.generatePreview(
+            auth.user.id, asset.id, r2Key,
+          );
+          await this.assetRepository.upsertFile({
+            assetId: asset.id, path: previewKey,
+            type: AssetFileType.Preview, isEdited: 0,
+          });
+        } catch (thumbErr) {
+          console.warn('Thumbnail generation failed:', thumbErr);
+        }
+      }
+
+      // Handle sidecar file
+      if (sidecarData && sidecarName) {
+        const sidecarKey = StorageCore.getAssetSidecarKey(auth.user.id, asset.id);
+        await this.storageRepository.writeFile(sidecarKey, sidecarData, {
+          contentType: 'application/xml',
+        });
+        await this.assetRepository.upsertFile({
+          assetId: asset.id,
+          path: sidecarKey,
+          type: AssetFileType.Sidecar,
+          isEdited: 0,
+        });
+      }
+
+      // Update user usage
+      await this.ctx.db
+        .updateTable('user')
+        .set((eb) => ({
+          quotaUsageInBytes: eb('quotaUsageInBytes', '+', fileSize),
+        }))
+        .where('id', '=', auth.user.id)
+        .execute();
 
       return { id: asset.id, status: AssetMediaStatus.CREATED };
     } catch (error: any) {
-      return this.handleUploadError(error, auth, file, sidecarFile);
+      // Check for duplicate constraint violation
+      if (error?.message?.includes('UNIQUE constraint') && error?.message?.includes('checksum')) {
+        const checksum = await computeSha1(fileData);
+        const duplicateId = await this.assetRepository.getUploadAssetIdByChecksum(auth.user.id, checksum);
+        if (duplicateId) {
+          return { status: AssetMediaStatus.DUPLICATE, id: duplicateId };
+        }
+      }
+      throw error;
     }
   }
+
+  // -------------------------------------------------------------------------
+  // Replace
+  // -------------------------------------------------------------------------
 
   async replaceAsset(
     auth: AuthDto,
     id: string,
     dto: AssetMediaReplaceDto,
-    file: UploadFile,
-    sidecarFile?: UploadFile,
+    fileData: ArrayBuffer,
+    originalName: string,
   ): Promise<AssetMediaResponseDto> {
-    try {
-      await this.requireAccess({ auth, permission: Permission.AssetUpdate, ids: [id] });
-      const asset = await this.assetRepository.getById(id);
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.AssetUpdate,
+      ids: [id],
+    });
 
-      if (!asset) {
-        throw new Error('Asset not found');
-      }
-
-      this.requireQuota(auth, file.size);
-
-      await this.replaceFileData(asset.id, dto, file, sidecarFile?.originalPath);
-
-      // Next, create a backup copy of the existing record. The db record has already been updated above,
-      // but the local variable holds the original file data paths.
-      const copiedPhoto = await this.createCopy(asset);
-      // and immediate trash it
-      await this.assetRepository.updateAll([copiedPhoto.id], { deletedAt: new Date(), status: AssetStatus.Trashed });
-      await this.eventRepository.emit('AssetTrash', { assetId: copiedPhoto.id, userId: auth.user.id });
-
-      await this.userRepository.updateUsage(auth.user.id, file.size);
-
-      return { status: AssetMediaStatus.REPLACED, id: copiedPhoto.id };
-    } catch (error: any) {
-      return this.handleUploadError(error, auth, file, sidecarFile);
+    const asset = await this.assetRepository.getById(id);
+    if (!asset) {
+      throw new Error('Asset not found');
     }
+
+    this.requireQuota(auth, fileData.byteLength);
+
+    const checksum = await computeSha1(fileData);
+    const ext = extname(originalName);
+    const r2Key = StorageCore.getAssetOriginalKey(auth.user.id, id, ext);
+
+    // Upload new file
+    const contentType = mimeTypes.lookup(originalName) || 'application/octet-stream';
+    await this.storageRepository.writeFile(r2Key, fileData, { contentType });
+
+    // Update asset record
+    await this.assetRepository.update({
+      id,
+      checksum,
+      originalPath: r2Key,
+      type: mimeTypes.assetType(originalName),
+      originalFileName: originalName,
+      deviceAssetId: dto.deviceAssetId,
+      deviceId: dto.deviceId,
+      fileCreatedAt: dto.fileCreatedAt ? new Date(dto.fileCreatedAt).toISOString() : undefined,
+      fileModifiedAt: dto.fileModifiedAt ? new Date(dto.fileModifiedAt).toISOString() : undefined,
+      localDateTime: dto.fileCreatedAt ? new Date(dto.fileCreatedAt).toISOString() : undefined,
+      duration: dto.duration || null,
+      livePhotoVideoId: null,
+    });
+
+    // Update exif
+    await this.assetRepository.upsertExif(
+      { assetId: id, fileSizeInByte: fileData.byteLength },
+      { lockedPropertiesBehavior: 'override' },
+    );
+
+    // Update user usage
+    await this.ctx.db
+      .updateTable('user')
+      .set((eb) => ({
+        quotaUsageInBytes: eb('quotaUsageInBytes', '+', fileData.byteLength),
+      }))
+      .where('id', '=', auth.user.id)
+      .execute();
+
+    return { status: AssetMediaStatus.REPLACED, id };
   }
 
-  async downloadOriginal(auth: AuthDto, id: string, dto: AssetDownloadOriginalDto): Promise<ImmichFileResponse> {
-    await this.requireAccess({ auth, permission: Permission.AssetDownload, ids: [id] });
+  // -------------------------------------------------------------------------
+  // Download original
+  // -------------------------------------------------------------------------
+
+  async downloadOriginal(
+    auth: AuthDto,
+    id: string,
+    dto: AssetDownloadOriginalDto,
+  ): Promise<{ body: ReadableStream | null; contentType: string; fileName: string; size: number }> {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.AssetDownload,
+      ids: [id],
+    });
 
     if (auth.sharedLink) {
       dto.edited = true;
@@ -205,25 +372,41 @@ export class AssetMediaService extends BaseService {
       dto.edited ?? false,
     );
 
-    const path = editedPath ?? originalPath!;
+    const path = (editedPath as string | undefined) ?? originalPath!;
+    const r2Object = await this.storageRepository.readFile(path);
 
-    return new ImmichFileResponse({
-      path,
-      fileName: getFileNameWithoutExtension(originalFileName) + getFilenameExtension(path),
-      contentType: mimeTypes.lookup(path),
-      cacheControl: CacheControl.PrivateWithCache,
-    });
+    if (!r2Object) {
+      throw new Error('Asset file not found in storage');
+    }
+
+    const fileName = getFileNameWithoutExtension(originalFileName) + getFilenameExtension(path);
+    const contentType = mimeTypes.lookup(path) || 'application/octet-stream';
+
+    return {
+      body: r2Object.body,
+      contentType,
+      fileName,
+      size: r2Object.size,
+    };
   }
+
+  // -------------------------------------------------------------------------
+  // View thumbnail
+  // -------------------------------------------------------------------------
 
   async viewThumbnail(
     auth: AuthDto,
     id: string,
     dto: AssetMediaOptionsDto,
-  ): Promise<ImmichFileResponse | AssetMediaRedirectResponse> {
-    await this.requireAccess({ auth, permission: Permission.AssetView, ids: [id] });
+  ): Promise<{ body: ReadableStream | null; contentType: string; fileName: string; size: number } | AssetMediaRedirectResponse> {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.AssetView,
+      ids: [id],
+    });
 
     if (dto.size === AssetMediaSize.Original) {
-      throw new BadRequestException('May not request original file');
+      throw new Error('May not request original file');
     }
 
     if (auth.sharedLink) {
@@ -238,47 +421,72 @@ export class AssetMediaService extends BaseService {
     );
 
     if (size === AssetFileType.FullSize && mimeTypes.isWebSupportedImage(originalPath) && !dto.edited) {
-      // use original file for web supported images
       return { targetSize: 'original' };
     }
 
     if (dto.size === AssetMediaSize.FULLSIZE && !path) {
-      // downgrade to preview if fullsize is not available.
-      // e.g. disabled or not yet (re)generated
       return { targetSize: AssetMediaSize.PREVIEW };
     }
 
     if (!path) {
-      throw new NotFoundException('Asset media not found');
+      throw new Error('Asset media not found');
+    }
+
+    const r2Object = await this.storageRepository.readFile(path);
+    if (!r2Object) {
+      throw new Error('Thumbnail file not found in storage');
     }
 
     const fileName = `${getFileNameWithoutExtension(originalFileName)}_${size}${getFilenameExtension(path)}`;
+    const contentType = mimeTypes.lookup(path) || 'image/webp';
 
-    return new ImmichFileResponse({
+    return {
+      body: r2Object.body,
+      contentType,
       fileName,
-      path,
-      contentType: mimeTypes.lookup(path),
-      cacheControl: CacheControl.PrivateWithCache,
-    });
+      size: r2Object.size,
+    };
   }
 
-  async playbackVideo(auth: AuthDto, id: string): Promise<ImmichFileResponse> {
-    await this.requireAccess({ auth, permission: Permission.AssetView, ids: [id] });
+  // -------------------------------------------------------------------------
+  // Video playback
+  // -------------------------------------------------------------------------
+
+  async playbackVideo(
+    auth: AuthDto,
+    id: string,
+  ): Promise<{ body: ReadableStream | null; contentType: string; size: number; path: string }> {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.AssetView,
+      ids: [id],
+    });
 
     const asset = await this.assetRepository.getForVideo(id);
-
     if (!asset) {
-      throw new NotFoundException('Asset not found or asset is not a video');
+      throw new Error('Asset not found or asset is not a video');
     }
 
     const filepath = asset.encodedVideoPath || asset.originalPath;
+    const r2Object = await this.storageRepository.readFile(filepath);
 
-    return new ImmichFileResponse({
+    if (!r2Object) {
+      throw new Error('Video file not found in storage');
+    }
+
+    const contentType = mimeTypes.lookup(filepath) || 'video/mp4';
+
+    return {
+      body: r2Object.body,
+      contentType,
+      size: r2Object.size,
       path: filepath,
-      contentType: mimeTypes.lookup(filepath),
-      cacheControl: CacheControl.PrivateWithCache,
-    });
+    };
   }
+
+  // -------------------------------------------------------------------------
+  // Existence checks
+  // -------------------------------------------------------------------------
 
   async checkExistingAssets(
     auth: AuthDto,
@@ -293,17 +501,23 @@ export class AssetMediaService extends BaseService {
   }
 
   async bulkUploadCheck(auth: AuthDto, dto: AssetBulkUploadCheckDto): Promise<AssetBulkUploadCheckResponseDto> {
-    const checksums: Buffer[] = dto.assets.map((asset) => fromChecksum(asset.checksum));
+    const checksums: Uint8Array[] = dto.assets.map((asset) => fromChecksum(asset.checksum));
     const results = await this.assetRepository.getByChecksums(auth.user.id, checksums);
     const checksumMap: Record<string, { id: string; isTrashed: boolean }> = {};
 
     for (const { id, deletedAt, checksum } of results) {
-      checksumMap[checksum.toString('hex')] = { id, isTrashed: !!deletedAt };
+      const hex = checksum instanceof Uint8Array
+        ? uint8ArrayToHex(checksum)
+        : typeof checksum === 'string'
+          ? checksum
+          : '';
+      checksumMap[hex] = { id, isTrashed: !!deletedAt };
     }
 
     return {
       results: dto.assets.map(({ id, checksum }) => {
-        const duplicate = checksumMap[fromChecksum(checksum).toString('hex')];
+        const inputHex = uint8ArrayToHex(fromChecksum(checksum));
+        const duplicate = checksumMap[inputHex];
         if (duplicate) {
           return {
             id,
@@ -322,159 +536,22 @@ export class AssetMediaService extends BaseService {
     };
   }
 
-  private async handleUploadError(
-    error: any,
-    auth: AuthDto,
-    file: UploadFile,
-    sidecarFile?: UploadFile,
-  ): Promise<AssetMediaResponseDto> {
-    // clean up files
-    await this.jobRepository.queue({
-      name: JobName.FileDelete,
-      data: { files: [file.originalPath, sidecarFile?.originalPath] },
-    });
+  // -------------------------------------------------------------------------
+  // Helpers
+  // -------------------------------------------------------------------------
 
-    // handle duplicates with a success response
-    if (isAssetChecksumConstraint(error)) {
-      const duplicateId = await this.assetRepository.getUploadAssetIdByChecksum(auth.user.id, file.checksum);
-      if (!duplicateId) {
-        this.logger.error(`Error locating duplicate for checksum constraint`);
-        throw new InternalServerErrorException();
-      }
-      return { status: AssetMediaStatus.DUPLICATE, id: duplicateId };
-    }
+  async getUploadAssetIdByChecksum(auth: AuthDto, checksum?: string): Promise<AssetMediaResponseDto | undefined> {
+    if (!checksum) return;
 
-    this.logger.error(`Error uploading file ${error}`, error?.stack);
-    throw error;
-  }
+    const assetId = await this.assetRepository.getUploadAssetIdByChecksum(auth.user.id, fromChecksum(checksum));
+    if (!assetId) return;
 
-  /**
-   * Updates the specified assetId to the specified photo data file properties: checksum, path,
-   * timestamps, deviceIds, and sidecar. Derived properties like: faces, smart search info, etc
-   * are UNTOUCHED. The photo data files modification times on the filesysytem are updated to
-   * the specified timestamps. The exif db record is upserted, and then A METADATA_EXTRACTION
-   * job is queued to update these derived properties.
-   */
-  private async replaceFileData(
-    assetId: string,
-    dto: AssetMediaReplaceDto,
-    file: UploadFile,
-    sidecarPath?: string,
-  ): Promise<void> {
-    await this.assetRepository.update({
-      id: assetId,
-
-      checksum: file.checksum,
-      originalPath: file.originalPath,
-      type: mimeTypes.assetType(file.originalPath),
-      originalFileName: file.originalName,
-
-      deviceAssetId: dto.deviceAssetId,
-      deviceId: dto.deviceId,
-      fileCreatedAt: dto.fileCreatedAt,
-      fileModifiedAt: dto.fileModifiedAt,
-      localDateTime: dto.fileCreatedAt,
-      duration: dto.duration || null,
-
-      livePhotoVideoId: null,
-    });
-
-    await (sidecarPath
-      ? this.assetRepository.upsertFile({ assetId, type: AssetFileType.Sidecar, path: sidecarPath })
-      : this.assetRepository.deleteFile({ assetId, type: AssetFileType.Sidecar }));
-
-    await this.storageRepository.utimes(file.originalPath, new Date(), new Date(dto.fileModifiedAt));
-    await this.assetRepository.upsertExif(
-      { assetId, fileSizeInByte: file.size },
-      { lockedPropertiesBehavior: 'override' },
-    );
-    await this.jobRepository.queue({
-      name: JobName.AssetExtractMetadata,
-      data: { id: assetId, source: 'upload' },
-    });
-  }
-
-  /**
-   * Create a 'shallow' copy of the specified asset record creating a new asset record in the database.
-   * Uses only vital properties excluding things like: stacks, faces, smart search info, etc,
-   * and then queues a METADATA_EXTRACTION job.
-   */
-  private async createCopy(asset: Omit<Asset, 'id'>) {
-    const created = await this.assetRepository.create({
-      ownerId: asset.ownerId,
-      originalPath: asset.originalPath,
-      originalFileName: asset.originalFileName,
-      libraryId: asset.libraryId,
-      deviceAssetId: asset.deviceAssetId,
-      deviceId: asset.deviceId,
-      type: asset.type,
-      checksum: asset.checksum,
-      fileCreatedAt: asset.fileCreatedAt,
-      localDateTime: asset.localDateTime,
-      fileModifiedAt: asset.fileModifiedAt,
-      livePhotoVideoId: asset.livePhotoVideoId,
-    });
-
-    const { size } = await this.storageRepository.stat(created.originalPath);
-    await this.assetRepository.upsertExif(
-      { assetId: created.id, fileSizeInByte: size },
-      { lockedPropertiesBehavior: 'override' },
-    );
-    await this.jobRepository.queue({ name: JobName.AssetExtractMetadata, data: { id: created.id, source: 'copy' } });
-    return created;
-  }
-
-  private async create(ownerId: string, dto: AssetMediaCreateDto, file: UploadFile, sidecarFile?: UploadFile) {
-    const asset = await this.assetRepository.create({
-      ownerId,
-      libraryId: null,
-
-      checksum: file.checksum,
-      originalPath: file.originalPath,
-
-      deviceAssetId: dto.deviceAssetId,
-      deviceId: dto.deviceId,
-
-      fileCreatedAt: dto.fileCreatedAt,
-      fileModifiedAt: dto.fileModifiedAt,
-      localDateTime: dto.fileCreatedAt,
-
-      type: mimeTypes.assetType(file.originalPath),
-      isFavorite: dto.isFavorite,
-      duration: dto.duration || null,
-      visibility: dto.visibility ?? AssetVisibility.Timeline,
-      livePhotoVideoId: dto.livePhotoVideoId,
-      originalFileName: dto.filename || file.originalName,
-    });
-
-    if (dto.metadata?.length) {
-      await this.assetRepository.upsertMetadata(asset.id, dto.metadata);
-    }
-
-    if (sidecarFile) {
-      await this.assetRepository.upsertFile({
-        assetId: asset.id,
-        path: sidecarFile.originalPath,
-        type: AssetFileType.Sidecar,
-      });
-      await this.storageRepository.utimes(sidecarFile.originalPath, new Date(), new Date(dto.fileModifiedAt));
-    }
-    await this.storageRepository.utimes(file.originalPath, new Date(), new Date(dto.fileModifiedAt));
-    await this.assetRepository.upsertExif(
-      { assetId: asset.id, fileSizeInByte: file.size },
-      { lockedPropertiesBehavior: 'override' },
-    );
-
-    await this.eventRepository.emit('AssetCreate', { asset });
-
-    await this.jobRepository.queue({ name: JobName.AssetExtractMetadata, data: { id: asset.id, source: 'upload' } });
-
-    return asset;
+    return { id: assetId, status: AssetMediaStatus.DUPLICATE };
   }
 
   private requireQuota(auth: AuthDto, size: number) {
     if (auth.user.quotaSizeInBytes !== null && auth.user.quotaSizeInBytes < auth.user.quotaUsageInBytes + size) {
-      throw new BadRequestException('Quota has been exceeded!');
+      throw new Error('Quota has been exceeded!');
     }
   }
 }

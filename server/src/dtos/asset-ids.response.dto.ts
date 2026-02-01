@@ -1,5 +1,4 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { ValidateUUID } from 'src/validation';
+import { z } from 'zod';
 
 /** @deprecated Use `BulkIdResponseDto` instead */
 export enum AssetIdErrorReason {
@@ -9,12 +8,9 @@ export enum AssetIdErrorReason {
 }
 
 /** @deprecated Use `BulkIdResponseDto` instead */
-export class AssetIdsResponseDto {
-  @ApiProperty({ description: 'Asset ID' })
-  assetId!: string;
-  @ApiProperty({ description: 'Whether operation succeeded' })
-  success!: boolean;
-  @ApiPropertyOptional({ description: 'Error reason if failed', enum: AssetIdErrorReason })
+export interface AssetIdsResponseDto {
+  assetId: string;
+  success: boolean;
   error?: AssetIdErrorReason;
 }
 
@@ -25,16 +21,13 @@ export enum BulkIdErrorReason {
   UNKNOWN = 'unknown',
 }
 
-export class BulkIdsDto {
-  @ValidateUUID({ each: true, description: 'IDs to process' })
-  ids!: string[];
-}
+export const BulkIdsSchema = z.object({
+  ids: z.array(z.string().uuid()).min(1),
+});
+export type BulkIdsDto = z.infer<typeof BulkIdsSchema>;
 
-export class BulkIdResponseDto {
-  @ApiProperty({ description: 'ID' })
-  id!: string;
-  @ApiProperty({ description: 'Whether operation succeeded' })
-  success!: boolean;
-  @ApiPropertyOptional({ description: 'Error reason if failed', enum: BulkIdErrorReason })
+export interface BulkIdResponseDto {
+  id: string;
+  success: boolean;
   error?: BulkIdErrorReason;
 }

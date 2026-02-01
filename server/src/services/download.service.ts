@@ -1,70 +1,95 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
-import { parse } from 'node:path';
-import { StorageCore } from 'src/cores/storage.core';
-import { AssetIdsDto } from 'src/dtos/asset.dto';
-import { AuthDto } from 'src/dtos/auth.dto';
-import { DownloadArchiveInfo, DownloadInfoDto, DownloadResponseDto } from 'src/dtos/download.dto';
+/**
+ * Download service -- Workers-compatible version.
+ *
+ * Provides download info and streaming ZIP archive creation using fflate.
+ * No NestJS, no Node.js streams, no archiver.
+ */
+
+import { Zip, ZipPassThrough } from 'fflate';
+import type { AuthDto } from 'src/dtos/auth.dto';
+import type { DownloadInfoDto, DownloadResponseDto, DownloadArchiveInfo } from 'src/dtos/download.dto';
+import type { ServiceContext } from 'src/context';
+import { AccessRepository } from 'src/repositories/access.repository';
+import { requireAccess } from 'src/utils/access';
 import { Permission } from 'src/enum';
-import { ImmichReadStream } from 'src/repositories/storage.repository';
-import { BaseService } from 'src/services/base.service';
-import { HumanReadableSize } from 'src/utils/bytes';
-import { getPreferences } from 'src/utils/preferences';
+import { BadRequestException } from 'src/utils/errors';
 
-@Injectable()
-export class DownloadService extends BaseService {
+const GiB = 1024 * 1024 * 1024;
+
+export class DownloadService {
+  private accessRepository: AccessRepository;
+
+  private get db() {
+    return this.ctx.db;
+  }
+
+  private get bucket() {
+    return this.ctx.bucket;
+  }
+
+  constructor(private ctx: ServiceContext) {
+    this.accessRepository = new AccessRepository(ctx.db);
+  }
+
   async getDownloadInfo(auth: AuthDto, dto: DownloadInfoDto): Promise<DownloadResponseDto> {
-    let assets;
+    let assets: Array<{ id: string; fileSizeInByte: number | null; livePhotoVideoId: string | null }>;
 
-    if (dto.assetIds) {
-      const assetIds = dto.assetIds;
-      await this.requireAccess({ auth, permission: Permission.AssetDownload, ids: assetIds });
-      assets = this.downloadRepository.downloadAssetIds(assetIds);
+    if (dto.assetIds && dto.assetIds.length > 0) {
+      await requireAccess(this.accessRepository, {
+        auth,
+        permission: Permission.AssetDownload,
+        ids: dto.assetIds,
+      });
+
+      assets = await this.db
+        .selectFrom('asset')
+        .innerJoin('asset_exif', 'asset_exif.assetId', 'asset.id')
+        .select(['asset.id', 'asset_exif.fileSizeInByte', 'asset.livePhotoVideoId'])
+        .where('asset.id', 'in', dto.assetIds)
+        .execute();
     } else if (dto.albumId) {
-      const albumId = dto.albumId;
-      await this.requireAccess({ auth, permission: Permission.AlbumDownload, ids: [albumId] });
-      assets = this.downloadRepository.downloadAlbumId(albumId);
+      await requireAccess(this.accessRepository, {
+        auth,
+        permission: Permission.AlbumDownload,
+        ids: [dto.albumId],
+      });
+
+      assets = await this.db
+        .selectFrom('album_asset')
+        .innerJoin('asset', 'asset.id', 'album_asset.assetId')
+        .innerJoin('asset_exif', 'asset_exif.assetId', 'asset.id')
+        .select(['asset.id', 'asset_exif.fileSizeInByte', 'asset.livePhotoVideoId'])
+        .where('album_asset.albumId', '=', dto.albumId)
+        .execute();
     } else if (dto.userId) {
-      const userId = dto.userId;
-      await this.requireAccess({ auth, permission: Permission.TimelineDownload, ids: [userId] });
-      assets = this.downloadRepository.downloadUserId(userId);
+      await requireAccess(this.accessRepository, {
+        auth,
+        permission: Permission.TimelineDownload,
+        ids: [dto.userId],
+      });
+
+      assets = await this.db
+        .selectFrom('asset')
+        .innerJoin('asset_exif', 'asset_exif.assetId', 'asset.id')
+        .select(['asset.id', 'asset_exif.fileSizeInByte', 'asset.livePhotoVideoId'])
+        .where('asset.ownerId', '=', dto.userId)
+        .where('asset.deletedAt', 'is', null)
+        .execute();
     } else {
       throw new BadRequestException('assetIds, albumId, or userId is required');
     }
 
-    const targetSize = dto.archiveSize || HumanReadableSize.GiB * 4;
-    const metadata = await this.userRepository.getMetadata(auth.user.id);
-    const preferences = getPreferences(metadata);
-    const motionIds = new Set<string>();
+    const targetSize = dto.archiveSize || GiB * 4;
     const archives: DownloadArchiveInfo[] = [];
     let archive: DownloadArchiveInfo = { size: 0, assetIds: [] };
 
-    const addToArchive = ({ id, size }: { id: string; size: number | null }) => {
-      archive.assetIds.push(id);
-      archive.size += Number(size || 0);
+    for (const asset of assets) {
+      archive.assetIds.push(asset.id);
+      archive.size += Number(asset.fileSizeInByte || 0);
 
       if (archive.size > targetSize) {
         archives.push(archive);
         archive = { size: 0, assetIds: [] };
-      }
-    };
-
-    for await (const asset of assets) {
-      // motion part of live photos
-      if (asset.livePhotoVideoId) {
-        motionIds.add(asset.livePhotoVideoId);
-      }
-
-      addToArchive(asset);
-    }
-
-    if (motionIds.size > 0) {
-      const motionAssets = this.downloadRepository.downloadMotionAssetIds([...motionIds]);
-      for await (const motionAsset of motionAssets) {
-        if (StorageCore.isAndroidMotionPath(motionAsset.originalPath) && !preferences.download.includeEmbeddedVideos) {
-          continue;
-        }
-
-        addToArchive(motionAsset);
       }
     }
 
@@ -73,49 +98,98 @@ export class DownloadService extends BaseService {
     }
 
     let totalSize = 0;
-    for (const archive of archives) {
-      totalSize += archive.size;
+    for (const a of archives) {
+      totalSize += a.size;
     }
 
     return { totalSize, archives };
   }
 
-  async downloadArchive(auth: AuthDto, dto: AssetIdsDto): Promise<ImmichReadStream> {
-    await this.requireAccess({ auth, permission: Permission.AssetDownload, ids: dto.assetIds });
+  /**
+   * Download a ZIP archive of assets using fflate streaming.
+   * Returns a Response with a streaming body.
+   */
+  async downloadArchive(auth: AuthDto, dto: { assetIds: string[] }): Promise<Response> {
+    await requireAccess(this.accessRepository, {
+      auth,
+      permission: Permission.AssetDownload,
+      ids: dto.assetIds,
+    });
 
-    const zip = this.storageRepository.createZipStream();
-    const assets = await this.assetRepository.getByIds(dto.assetIds);
-    const assetMap = new Map(assets.map((asset) => [asset.id, asset]));
-    const paths: Record<string, number> = {};
+    const assets = await this.db
+      .selectFrom('asset')
+      .select(['asset.id', 'asset.originalPath', 'asset.originalFileName'])
+      .where('asset.id', 'in', dto.assetIds)
+      .execute();
 
-    for (const assetId of dto.assetIds) {
-      const asset = assetMap.get(assetId);
-      if (!asset) {
-        continue;
+    // Create a streaming ZIP using fflate
+    const { readable, writable } = new TransformStream<Uint8Array>();
+    const writer = writable.getWriter();
+
+    const zip = new Zip((err, data, final) => {
+      if (err) {
+        writer.abort(err);
+        return;
+      }
+      writer.write(data);
+      if (final) {
+        writer.close();
+      }
+    });
+
+    // Process each asset in the background
+    const processAssets = async () => {
+      const paths: Record<string, number> = {};
+
+      for (const asset of assets) {
+        const r2Key = asset.originalPath;
+        const object = await this.bucket.get(r2Key);
+        if (!object) {
+          continue;
+        }
+
+        // Handle duplicate filenames
+        let filename = asset.originalFileName;
+        const count = paths[filename] || 0;
+        paths[filename] = count + 1;
+        if (count !== 0) {
+          const lastDot = filename.lastIndexOf('.');
+          if (lastDot > 0) {
+            filename = `${filename.slice(0, lastDot)}+${count}${filename.slice(lastDot)}`;
+          } else {
+            filename = `${filename}+${count}`;
+          }
+        }
+
+        // Use ZipPassThrough (store, no compression) for already-compressed formats
+        const file = new ZipPassThrough(filename);
+        zip.add(file);
+
+        const reader = object.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+          file.push(value, false);
+        }
+        file.push(new Uint8Array(0), true);
       }
 
-      const { originalPath, originalFileName } = asset;
+      zip.end();
+    };
 
-      let filename = originalFileName;
-      const count = paths[filename] || 0;
-      paths[filename] = count + 1;
-      if (count !== 0) {
-        const parsedFilename = parse(originalFileName);
-        filename = `${parsedFilename.name}+${count}${parsedFilename.ext}`;
-      }
+    // Start processing without awaiting -- the readable stream will be consumed by the client
+    processAssets().catch((err) => {
+      console.error('Error creating ZIP archive:', err);
+      writer.abort(err).catch(() => {});
+    });
 
-      let realpath = originalPath;
-      try {
-        realpath = await this.storageRepository.realpath(originalPath);
-      } catch {
-        this.logger.warn('Unable to resolve realpath', { originalPath });
-      }
-
-      zip.addFile(realpath, filename);
-    }
-
-    void zip.finalize();
-
-    return { stream: zip.stream };
+    return new Response(readable, {
+      headers: {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': 'attachment; filename="immich-download.zip"',
+      },
+    });
   }
 }

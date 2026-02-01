@@ -1,0 +1,1 @@
+const c="關於",o="帳號",t="帳號設定",n="動作",a="星期",s={about:"關於",account:"帳號",account_settings:t,action:"動作",week:"星期"};export{c as about,o as account,t as account_settings,n as action,s as default,a as week};

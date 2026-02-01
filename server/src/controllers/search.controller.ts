@@ -3,21 +3,6 @@ import { ApiTags } from '@nestjs/swagger';
 import { Endpoint, HistoryBuilder } from 'src/decorators';
 import { AssetResponseDto } from 'src/dtos/asset-response.dto';
 import { AuthDto } from 'src/dtos/auth.dto';
-import { PersonResponseDto } from 'src/dtos/person.dto';
-import {
-  LargeAssetSearchDto,
-  MetadataSearchDto,
-  PlacesResponseDto,
-  RandomSearchDto,
-  SearchExploreResponseDto,
-  SearchPeopleDto,
-  SearchPlacesDto,
-  SearchResponseDto,
-  SearchStatisticsResponseDto,
-  SearchSuggestionRequestDto,
-  SmartSearchDto,
-  StatisticsSearchDto,
-} from 'src/dtos/search.dto';
 import { ApiTag, Permission } from 'src/enum';
 import { Auth, Authenticated } from 'src/middleware/auth.guard';
 import { SearchService } from 'src/services/search.service';

@@ -1,0 +1,1 @@
+import{d,j as a}from"./gegweU97.js";function g(){}function b(n,i){return n<i}function h(n,i,s){for(var t=-1,l=n.length;++t<l;){var o=n[t],e=i(o);if(e!=null&&(f===void 0?e===e&&!d(e):s(e,f)))var f=e,m=o}return m}function x(n,i){return n&&n.length?h(n,a(i),b):void 0}export{x as m,g as n};

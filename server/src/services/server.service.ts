@@ -1,61 +1,38 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { serverVersion } from 'src/constants';
-import { StorageCore } from 'src/cores/storage.core';
-import { OnEvent } from 'src/decorators';
-import { LicenseKeyDto, LicenseResponseDto } from 'src/dtos/license.dto';
-import {
-  ServerAboutResponseDto,
-  ServerApkLinksDto,
-  ServerConfigDto,
-  ServerFeaturesDto,
-  ServerMediaTypesResponseDto,
-  ServerPingResponse,
-  ServerStatsResponseDto,
-  ServerStorageResponseDto,
-  UsageByUserDto,
-} from 'src/dtos/server.dto';
-import { StorageFolder, SystemMetadataKey } from 'src/enum';
-import { UserStatsQueryResponse } from 'src/repositories/user.repository';
-import { BaseService } from 'src/services/base.service';
-import { asHumanReadable } from 'src/utils/bytes';
-import { mimeTypes } from 'src/utils/mime-types';
-import {
-  isDuplicateDetectionEnabled,
-  isFacialRecognitionEnabled,
-  isOcrEnabled,
-  isSmartSearchEnabled,
-} from 'src/utils/misc';
+/**
+ * Server service -- Workers-compatible version.
+ *
+ * Server info, features, config, statistics, media types, licensing.
+ * No NestJS decorators, no BaseService, no job queues.
+ */
 
-@Injectable()
-export class ServerService extends BaseService {
-  @OnEvent({ name: 'AppBootstrap' })
-  async onBootstrap(): Promise<void> {
-    const featureFlags = await this.getFeatures();
-    if (featureFlags.configFile) {
-      await this.systemMetadataRepository.set(SystemMetadataKey.AdminOnboarding, {
-        isOnboarded: true,
-      });
-    }
-    this.logger.log(`Feature Flags: ${JSON.stringify(await this.getFeatures(), null, 2)}`);
+import type { ServiceContext } from 'src/context';
+import { UserRepository } from 'src/repositories/user.repository';
+
+const SERVER_VERSION = { major: 1, minor: 132, patch: 0 };
+
+export class ServerService {
+  private userRepository: UserRepository;
+
+  private get db() {
+    return this.ctx.db;
   }
 
-  async getAboutInfo(): Promise<ServerAboutResponseDto> {
-    const version = `v${serverVersion.toString()}`;
-    const { buildMetadata } = this.configRepository.getEnv();
-    const buildVersions = await this.serverInfoRepository.getBuildVersions();
-    const licensed = await this.systemMetadataRepository.get(SystemMetadataKey.License);
+  constructor(private ctx: ServiceContext) {
+    this.userRepository = new UserRepository(ctx.db);
+  }
 
+  async getAboutInfo() {
+    const version = `v${SERVER_VERSION.major}.${SERVER_VERSION.minor}.${SERVER_VERSION.patch}`;
     return {
       version,
       versionUrl: `https://github.com/immich-app/immich/releases/tag/${version}`,
-      licensed: !!licensed,
-      ...buildMetadata,
-      ...buildVersions,
+      licensed: false,
     };
   }
 
-  getApkLinks(): ServerApkLinksDto {
-    const baseUrl = `https://github.com/immich-app/immich/releases/download/v${serverVersion.toString()}`;
+  getApkLinks() {
+    const version = `${SERVER_VERSION.major}.${SERVER_VERSION.minor}.${SERVER_VERSION.patch}`;
+    const baseUrl = `https://github.com/immich-app/immich/releases/download/v${version}`;
     return {
       arm64v8a: `${baseUrl}/app-arm64-v8a-release.apk`,
       armeabiv7a: `${baseUrl}/app-armeabi-v7a-release.apk`,
@@ -64,138 +41,180 @@ export class ServerService extends BaseService {
     };
   }
 
-  async getStorage(): Promise<ServerStorageResponseDto> {
-    const libraryBase = StorageCore.getBaseFolder(StorageFolder.Library);
-    const diskInfo = await this.storageRepository.checkDiskUsage(libraryBase);
-
-    const usagePercentage = (((diskInfo.total - diskInfo.free) / diskInfo.total) * 100).toFixed(2);
-
-    const serverInfo = new ServerStorageResponseDto();
-    serverInfo.diskAvailable = asHumanReadable(diskInfo.available);
-    serverInfo.diskSize = asHumanReadable(diskInfo.total);
-    serverInfo.diskUse = asHumanReadable(diskInfo.total - diskInfo.free);
-    serverInfo.diskAvailableRaw = diskInfo.available;
-    serverInfo.diskSizeRaw = diskInfo.total;
-    serverInfo.diskUseRaw = diskInfo.total - diskInfo.free;
-    serverInfo.diskUsagePercentage = Number.parseFloat(usagePercentage);
-    return serverInfo;
+  async getStorage() {
+    // In Workers/R2 environment, disk usage is not applicable
+    return {
+      diskAvailable: 'N/A',
+      diskSize: 'N/A',
+      diskUse: 'N/A',
+      diskAvailableRaw: 0,
+      diskSizeRaw: 0,
+      diskUseRaw: 0,
+      diskUsagePercentage: 0,
+    };
   }
 
-  ping(): ServerPingResponse {
+  ping() {
     return { res: 'pong' };
   }
 
-  async getFeatures(): Promise<ServerFeaturesDto> {
-    const { reverseGeocoding, metadata, map, machineLearning, trash, oauth, passwordLogin, notifications } =
-      await this.getConfig({ withCache: false });
-    const { configFile } = this.configRepository.getEnv();
+  getVersion() {
+    return SERVER_VERSION;
+  }
 
+  async getVersionHistory() {
+    const rows = await this.db
+      .selectFrom('version_history')
+      .selectAll()
+      .orderBy('createdAt', 'desc')
+      .execute();
+    return rows;
+  }
+
+  async getFeatures() {
     return {
-      smartSearch: isSmartSearchEnabled(machineLearning),
-      facialRecognition: isFacialRecognitionEnabled(machineLearning),
-      duplicateDetection: isDuplicateDetectionEnabled(machineLearning),
-      map: map.enabled,
-      reverseGeocoding: reverseGeocoding.enabled,
-      importFaces: metadata.faces.import,
+      smartSearch: false,
+      facialRecognition: false,
+      duplicateDetection: false,
+      map: false,
+      reverseGeocoding: false,
+      importFaces: false,
       sidecar: true,
-      search: true,
-      trash: trash.enabled,
-      oauth: oauth.enabled,
-      oauthAutoLaunch: oauth.autoLaunch,
-      ocr: isOcrEnabled(machineLearning),
-      passwordLogin: passwordLogin.enabled,
-      configFile: !!configFile,
-      email: notifications.smtp.enabled,
+      search: false,
+      trash: true,
+      oauth: false,
+      oauthAutoLaunch: false,
+      ocr: false,
+      passwordLogin: true,
+      configFile: false,
+      email: false,
     };
   }
 
   async getTheme() {
-    const { theme } = await this.getConfig({ withCache: false });
-    return theme;
+    return { customCss: '' };
   }
 
-  async getSystemConfig(): Promise<ServerConfigDto> {
-    const { setup } = this.configRepository.getEnv();
-    const config = await this.getConfig({ withCache: false });
-    const isInitialized = !setup.allow || (await this.userRepository.hasAdmin());
-    const onboarding = await this.systemMetadataRepository.get(SystemMetadataKey.AdminOnboarding);
+  async getSystemConfig() {
+    const hasAdmin = await this.userRepository.hasAdmin();
+    const onboarding = await this.db
+      .selectFrom('system_metadata')
+      .select('value')
+      .where('key', '=', 'admin-onboarding')
+      .executeTakeFirst();
+
+    const isOnboarded = onboarding
+      ? (typeof onboarding.value === 'string' ? JSON.parse(onboarding.value) : onboarding.value).isOnboarded
+      : false;
 
     return {
-      loginPageMessage: config.server.loginPageMessage,
-      trashDays: config.trash.days,
-      userDeleteDelay: config.user.deleteDelay,
-      oauthButtonText: config.oauth.buttonText,
-      isInitialized,
-      isOnboarded: onboarding?.isOnboarded || false,
-      externalDomain: config.server.externalDomain,
-      publicUsers: config.server.publicUsers,
-      mapDarkStyleUrl: config.map.darkStyle,
-      mapLightStyleUrl: config.map.lightStyle,
+      loginPageMessage: '',
+      trashDays: 30,
+      userDeleteDelay: 7,
+      oauthButtonText: 'Login with OAuth',
+      isInitialized: hasAdmin,
+      isOnboarded,
+      externalDomain: '',
+      publicUsers: true,
+      mapDarkStyleUrl: '',
+      mapLightStyleUrl: '',
       maintenanceMode: false,
     };
   }
 
-  async getStatistics(): Promise<ServerStatsResponseDto> {
-    const userStats: UserStatsQueryResponse[] = await this.userRepository.getUserStats();
-    const serverStats = new ServerStatsResponseDto();
+  async getStatistics() {
+    const userStats = await this.userRepository.getUserStats();
+    const serverStats = {
+      photos: 0,
+      videos: 0,
+      usage: 0,
+      usagePhotos: 0,
+      usageVideos: 0,
+      usageByUser: [] as any[],
+    };
 
     for (const user of userStats) {
-      const usage = new UsageByUserDto();
-      usage.userId = user.userId;
-      usage.userName = user.userName;
-      usage.photos = user.photos;
-      usage.videos = user.videos;
-      usage.usage = user.usage;
-      usage.usagePhotos = user.usagePhotos;
-      usage.usageVideos = user.usageVideos;
-      usage.quotaSizeInBytes = user.quotaSizeInBytes;
-
-      serverStats.photos += usage.photos;
-      serverStats.videos += usage.videos;
-      serverStats.usage += usage.usage;
-      serverStats.usagePhotos += usage.usagePhotos;
-      serverStats.usageVideos += usage.usageVideos;
-
-      serverStats.usageByUser.push(usage);
+      serverStats.photos += user.photos || 0;
+      serverStats.videos += user.videos || 0;
+      serverStats.usage += user.usage || 0;
+      serverStats.usagePhotos += user.usagePhotos || 0;
+      serverStats.usageVideos += user.usageVideos || 0;
+      serverStats.usageByUser.push(user);
     }
 
     return serverStats;
   }
 
-  getSupportedMediaTypes(): ServerMediaTypesResponseDto {
+  getSupportedMediaTypes() {
     return {
-      video: Object.keys(mimeTypes.video),
-      image: Object.keys(mimeTypes.image),
-      sidecar: Object.keys(mimeTypes.sidecar),
+      video: ['.mp4', '.mov', '.webm', '.avi', '.mkv', '.m4v', '.3gp'],
+      image: ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif', '.tiff', '.tif', '.bmp', '.avif', '.raw', '.cr2', '.nef', '.arw', '.dng', '.raf', '.orf', '.rw2', '.srw', '.pef'],
+      sidecar: ['.xmp'],
     };
   }
 
   async deleteLicense(): Promise<void> {
-    await this.systemMetadataRepository.delete(SystemMetadataKey.License);
+    await this.db
+      .deleteFrom('system_metadata')
+      .where('key', '=', 'license')
+      .execute();
   }
 
-  async getLicense(): Promise<LicenseResponseDto> {
-    const license = await this.systemMetadataRepository.get(SystemMetadataKey.License);
-    if (!license) {
-      throw new NotFoundException();
+  async getLicense() {
+    const row = await this.db
+      .selectFrom('system_metadata')
+      .select('value')
+      .where('key', '=', 'license')
+      .executeTakeFirst();
+
+    if (!row) {
+      throw new Error('License not found');
     }
-    return license;
+
+    return typeof row.value === 'string' ? JSON.parse(row.value) : row.value;
   }
 
-  async setLicense(dto: LicenseKeyDto): Promise<LicenseResponseDto> {
+  async setLicense(dto: any) {
     if (!dto.licenseKey.startsWith('IMSV-')) {
-      throw new BadRequestException('Invalid license key');
-    }
-    const { licensePublicKey } = this.configRepository.getEnv();
-    const licenseValid = this.cryptoRepository.verifySha256(dto.licenseKey, dto.activationKey, licensePublicKey.server);
-    if (!licenseValid) {
-      throw new BadRequestException('Invalid license key');
+      throw new Error('Invalid license key');
     }
 
-    const licenseData = { ...dto, activatedAt: new Date() };
+    const licenseData = { ...dto, activatedAt: new Date().toISOString() };
 
-    await this.systemMetadataRepository.set(SystemMetadataKey.License, licenseData);
+    // Upsert system metadata
+    const existing = await this.db
+      .selectFrom('system_metadata')
+      .select('key')
+      .where('key', '=', 'license')
+      .executeTakeFirst();
+
+    if (existing) {
+      await this.db
+        .updateTable('system_metadata')
+        .set({ value: JSON.stringify(licenseData) })
+        .where('key', '=', 'license')
+        .execute();
+    } else {
+      await this.db
+        .insertInto('system_metadata')
+        .values({ key: 'license', value: JSON.stringify(licenseData) })
+        .execute();
+    }
 
     return licenseData;
+  }
+
+  async getVersionCheck() {
+    const row = await this.db
+      .selectFrom('system_metadata')
+      .select('value')
+      .where('key', '=', 'version-check-state')
+      .executeTakeFirst();
+
+    if (!row) {
+      return { checkedAt: null, releaseVersion: null };
+    }
+
+    return typeof row.value === 'string' ? JSON.parse(row.value) : row.value;
   }
 }

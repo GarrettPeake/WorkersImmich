@@ -1,16 +1,12 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { ValidateEnum } from 'src/validation';
-
 export enum AssetMediaStatus {
   CREATED = 'created',
   REPLACED = 'replaced',
   DUPLICATE = 'duplicate',
 }
-export class AssetMediaResponseDto {
-  @ValidateEnum({ enum: AssetMediaStatus, name: 'AssetMediaStatus', description: 'Upload status' })
-  status!: AssetMediaStatus;
-  @ApiProperty({ description: 'Asset media ID' })
-  id!: string;
+
+export interface AssetMediaResponseDto {
+  status: AssetMediaStatus;
+  id: string;
 }
 
 export enum AssetUploadAction {
@@ -23,25 +19,18 @@ export enum AssetRejectReason {
   UNSUPPORTED_FORMAT = 'unsupported-format',
 }
 
-export class AssetBulkUploadCheckResult {
-  @ApiProperty({ description: 'Asset ID' })
-  id!: string;
-  @ApiProperty({ description: 'Upload action', enum: AssetUploadAction })
-  action!: AssetUploadAction;
-  @ApiPropertyOptional({ description: 'Rejection reason if rejected', enum: AssetRejectReason })
+export interface AssetBulkUploadCheckResult {
+  id: string;
+  action: AssetUploadAction;
   reason?: AssetRejectReason;
-  @ApiPropertyOptional({ description: 'Existing asset ID if duplicate' })
   assetId?: string;
-  @ApiPropertyOptional({ description: 'Whether existing asset is trashed' })
   isTrashed?: boolean;
 }
 
-export class AssetBulkUploadCheckResponseDto {
-  @ApiProperty({ description: 'Upload check results' })
-  results!: AssetBulkUploadCheckResult[];
+export interface AssetBulkUploadCheckResponseDto {
+  results: AssetBulkUploadCheckResult[];
 }
 
-export class CheckExistingAssetsResponseDto {
-  @ApiProperty({ description: 'Existing asset IDs' })
-  existingIds!: string[];
+export interface CheckExistingAssetsResponseDto {
+  existingIds: string[];
 }

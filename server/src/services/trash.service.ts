@@ -1,85 +1,131 @@
-import { Injectable } from '@nestjs/common';
-import { JOBS_ASSET_PAGINATION_SIZE } from 'src/constants';
-import { OnEvent, OnJob } from 'src/decorators';
-import { BulkIdsDto } from 'src/dtos/asset-ids.response.dto';
-import { AuthDto } from 'src/dtos/auth.dto';
-import { TrashResponseDto } from 'src/dtos/trash.dto';
-import { JobName, JobStatus, Permission, QueueName } from 'src/enum';
-import { BaseService } from 'src/services/base.service';
+/**
+ * Trash service -- Workers-compatible version.
+ *
+ * Manages trashed asset operations: empty trash (hard delete), restore all, restore specific.
+ * No NestJS, no background jobs. Empty trash immediately hard-deletes assets and R2 objects.
+ */
 
-@Injectable()
-export class TrashService extends BaseService {
-  async restoreAssets(auth: AuthDto, dto: BulkIdsDto): Promise<TrashResponseDto> {
-    const { ids } = dto;
-    if (ids.length === 0) {
+import type { AuthDto } from 'src/dtos/auth.dto';
+import type { TrashResponseDto } from 'src/dtos/trash.dto';
+import { AssetStatus } from 'src/enum';
+import type { ServiceContext } from 'src/context';
+
+export class TrashService {
+  private get db() {
+    return this.ctx.db;
+  }
+
+  private get bucket() {
+    return this.ctx.bucket;
+  }
+
+  constructor(private ctx: ServiceContext) {}
+
+  /**
+   * Empty trash: hard-delete all trashed assets and their R2 objects.
+   * In Workers there is no background job -- this runs inline.
+   */
+  async empty(auth: AuthDto): Promise<TrashResponseDto> {
+    const trashedAssets = await this.db
+      .selectFrom('asset')
+      .select(['asset.id', 'asset.originalPath'])
+      .where('asset.ownerId', '=', auth.user.id)
+      .where('asset.status', '=', AssetStatus.Trashed)
+      .execute();
+
+    if (trashedAssets.length === 0) {
       return { count: 0 };
     }
 
-    await this.requireAccess({ auth, permission: Permission.AssetDelete, ids });
-    await this.trashRepository.restoreAll(ids);
-    await this.eventRepository.emit('AssetRestoreAll', { assetIds: ids, userId: auth.user.id });
+    const assetIds = trashedAssets.map((a) => a.id);
 
-    this.logger.log(`Restored ${ids.length} asset(s) from trash`);
-
-    return { count: ids.length };
-  }
-
-  async restore(auth: AuthDto): Promise<TrashResponseDto> {
-    const count = await this.trashRepository.restore(auth.user.id);
-    if (count > 0) {
-      this.logger.log(`Restored ${count} asset(s) from trash`);
-    }
-    return { count };
-  }
-
-  async empty(auth: AuthDto): Promise<TrashResponseDto> {
-    const count = await this.trashRepository.empty(auth.user.id);
-    if (count > 0) {
-      await this.jobRepository.queue({ name: JobName.AssetEmptyTrash, data: {} });
-    }
-    return { count };
-  }
-
-  @OnEvent({ name: 'AssetDeleteAll' })
-  async onAssetsDelete() {
-    await this.jobRepository.queue({ name: JobName.AssetEmptyTrash, data: {} });
-  }
-
-  @OnJob({ name: JobName.AssetEmptyTrash, queue: QueueName.BackgroundTask })
-  async handleEmptyTrash() {
-    const assets = this.trashRepository.getDeletedIds();
-
-    let count = 0;
-    const batch: string[] = [];
-    for await (const { id } of assets) {
-      batch.push(id);
-
-      if (batch.length === JOBS_ASSET_PAGINATION_SIZE) {
-        await this.handleBatch(batch);
-        count += batch.length;
-        batch.length = 0;
+    // Delete R2 objects for each asset
+    const r2Deletions: Promise<void>[] = [];
+    for (const asset of trashedAssets) {
+      if (asset.originalPath) {
+        r2Deletions.push(this.bucket.delete(asset.originalPath).catch(() => {}));
       }
     }
 
-    await this.handleBatch(batch);
-    count += batch.length;
-    batch.length = 0;
+    // Also delete thumbnail/preview files from R2
+    const assetFiles = await this.db
+      .selectFrom('asset_file')
+      .select(['asset_file.path'])
+      .where('asset_file.assetId', 'in', assetIds)
+      .execute();
 
-    this.logger.log(`Queued ${count} asset(s) for deletion from the trash`);
+    for (const file of assetFiles) {
+      if (file.path) {
+        r2Deletions.push(this.bucket.delete(file.path).catch(() => {}));
+      }
+    }
 
-    return JobStatus.Success;
+    await Promise.allSettled(r2Deletions);
+
+    // Hard-delete from database (child tables first)
+    await this.db.deleteFrom('asset_file').where('assetId', 'in', assetIds).execute();
+    await this.db.deleteFrom('asset_exif').where('assetId', 'in', assetIds).execute();
+    await this.db.deleteFrom('asset_metadata').where('assetId', 'in', assetIds).execute();
+    await this.db.deleteFrom('asset_edit').where('assetId', 'in', assetIds).execute();
+    await this.db.deleteFrom('tag_asset').where('assetId', 'in', assetIds).execute();
+    await this.db.deleteFrom('album_asset').where('assetId', 'in', assetIds).execute();
+    await this.db.deleteFrom('shared_link_asset').where('assetId', 'in', assetIds).execute();
+    await this.db.deleteFrom('memory_asset').where('assetId', 'in', assetIds).execute();
+    await this.db.deleteFrom('activity').where('assetId', 'in', assetIds).execute();
+    await this.db.deleteFrom('asset').where('id', 'in', assetIds).execute();
+
+    return { count: trashedAssets.length };
   }
 
-  private async handleBatch(ids: string[]) {
-    this.logger.debug(`Queueing ${ids.length} asset(s) for deletion from the trash`);
-    await this.jobRepository.queueAll(
-      ids.map((assetId) => ({
-        name: JobName.AssetDelete,
-        data: {
-          id: assetId,
-          deleteOnDisk: true,
-        },
-      })),
-    );
+  /**
+   * Restore all trashed assets for the current user.
+   */
+  async restoreAll(auth: AuthDto): Promise<TrashResponseDto> {
+    const result = await this.db
+      .updateTable('asset')
+      .set({
+        deletedAt: null,
+        status: AssetStatus.Active,
+      })
+      .where('ownerId', '=', auth.user.id)
+      .where('status', '=', AssetStatus.Trashed)
+      .execute();
+
+    const count = result.reduce((sum, r) => sum + Number(r.numUpdatedRows ?? 0), 0);
+    return { count };
+  }
+
+  /**
+   * Restore specific trashed assets.
+   */
+  async restore(auth: AuthDto, dto: { ids: string[] }): Promise<TrashResponseDto> {
+    if (!dto.ids || dto.ids.length === 0) {
+      return { count: 0 };
+    }
+
+    const assets = await this.db
+      .selectFrom('asset')
+      .select(['asset.id'])
+      .where('asset.id', 'in', dto.ids)
+      .where('asset.ownerId', '=', auth.user.id)
+      .where('asset.status', '=', AssetStatus.Trashed)
+      .execute();
+
+    if (assets.length === 0) {
+      return { count: 0 };
+    }
+
+    const validIds = assets.map((a) => a.id);
+
+    await this.db
+      .updateTable('asset')
+      .set({
+        deletedAt: null,
+        status: AssetStatus.Active,
+      })
+      .where('id', 'in', validIds)
+      .execute();
+
+    return { count: validIds.length };
   }
 }

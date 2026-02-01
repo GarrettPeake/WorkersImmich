@@ -1,34 +1,23 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsInt, IsPositive } from 'class-validator';
-import { Optional, ValidateUUID } from 'src/validation';
+import { z } from 'zod';
 
-export class DownloadInfoDto {
-  @ValidateUUID({ each: true, optional: true, description: 'Asset IDs to download' })
-  assetIds?: string[];
+// --- Request Schemas ---
 
-  @ValidateUUID({ optional: true, description: 'Album ID to download' })
-  albumId?: string;
+export const DownloadInfoSchema = z.object({
+  assetIds: z.array(z.string().uuid()).optional(),
+  albumId: z.string().uuid().optional(),
+  userId: z.string().uuid().optional(),
+  archiveSize: z.coerce.number().int().positive().optional(),
+});
+export type DownloadInfoDto = z.infer<typeof DownloadInfoSchema>;
 
-  @ValidateUUID({ optional: true, description: 'User ID to download assets from' })
-  userId?: string;
+// --- Response DTOs (plain interfaces) ---
 
-  @ApiPropertyOptional({ type: 'integer', description: 'Archive size limit in bytes' })
-  @IsInt()
-  @IsPositive()
-  @Optional()
-  archiveSize?: number;
+export interface DownloadArchiveInfo {
+  size: number;
+  assetIds: string[];
 }
 
-export class DownloadResponseDto {
-  @ApiProperty({ type: 'integer', description: 'Total size in bytes' })
-  totalSize!: number;
-  @ApiProperty({ description: 'Archive information' })
-  archives!: DownloadArchiveInfo[];
-}
-
-export class DownloadArchiveInfo {
-  @ApiProperty({ type: 'integer', description: 'Archive size in bytes' })
-  size!: number;
-  @ApiProperty({ description: 'Asset IDs in this archive' })
-  assetIds!: string[];
+export interface DownloadResponseDto {
+  totalSize: number;
+  archives: DownloadArchiveInfo[];
 }

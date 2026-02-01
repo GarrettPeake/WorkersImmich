@@ -1,4 +1,4 @@
-import { extname } from 'node:path';
+import { extname } from 'src/utils/path';
 import { AssetType } from 'src/enum';
 
 const raw: Record<string, string[]> = {

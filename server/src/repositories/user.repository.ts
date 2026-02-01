@@ -1,15 +1,19 @@
-import { Injectable } from '@nestjs/common';
-import { ExpressionBuilder, Insertable, Kysely, sql, Updateable } from 'kysely';
-import { jsonArrayFrom } from 'kysely/helpers/postgres';
-import { DateTime } from 'luxon';
-import { InjectKysely } from 'nestjs-kysely';
-import { columns } from 'src/database';
-import { DummyValue, GenerateSql } from 'src/decorators';
-import { AssetType, AssetVisibility, UserStatus } from 'src/enum';
-import { DB } from 'src/schema';
-import { UserTable } from 'src/schema/tables/user.table';
-import { UserMetadata, UserMetadataItem } from 'src/types';
-import { asUuid } from 'src/utils/database';
+/**
+ * User repository -- Workers/D1-compatible version.
+ *
+ * Converted from PostgreSQL to D1/SQLite-compatible Kysely queries.
+ * Key changes:
+ * - No jsonArrayFrom from kysely/helpers/postgres
+ * - No @Injectable, @InjectKysely, @GenerateSql decorators
+ * - No ::uuid casts (asUuid removed)
+ * - No luxon DateTime -- use plain Date/string
+ * - filterWhere replaced with CASE WHEN SUM pattern for SQLite
+ * - Separate queries for metadata instead of nested json builders
+ */
+
+import type { Insertable, Kysely, Updateable } from 'kysely';
+import { sql } from 'kysely';
+import type { DB, UserTable } from 'src/schema';
 
 export interface UserListFilter {
   id?: string;
@@ -31,30 +35,34 @@ export interface UserFindOptions {
   withDeleted?: boolean;
 }
 
-const withMetadata = (eb: ExpressionBuilder<DB, 'user'>) => {
-  return jsonArrayFrom(
-    eb
-      .selectFrom('user_metadata')
-      .select(['user_metadata.key', 'user_metadata.value'])
-      .whereRef('user.id', '=', 'user_metadata.userId'),
-  ).as('metadata');
-};
-
-@Injectable()
 export class UserRepository {
-  constructor(@InjectKysely() private db: Kysely<DB>) {}
+  constructor(private db: Kysely<DB>) {}
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.BOOLEAN] })
-  get(userId: string, options: UserFindOptions) {
+  /**
+   * Convert SQLite integer booleans (0/1) to JS booleans for user rows.
+   */
+  private normalizeBooleans<T extends Record<string, unknown>>(user: T): T {
+    return {
+      ...user,
+      isAdmin: Boolean((user as any).isAdmin),
+      shouldChangePassword: Boolean((user as any).shouldChangePassword),
+    } as T;
+  }
+
+  async get(userId: string, options: UserFindOptions) {
     options = options || {};
 
-    return this.db
+    const user = await this.db
       .selectFrom('user')
-      .select(columns.userAdmin)
-      .select(withMetadata)
+      .selectAll()
       .where('user.id', '=', userId)
       .$if(!options.withDeleted, (eb) => eb.where('user.deletedAt', 'is', null))
       .executeTakeFirst();
+
+    if (!user) return undefined;
+
+    const metadata = await this.getMetadata(userId);
+    return { ...this.normalizeBooleans(user), metadata };
   }
 
   getMetadata(userId: string) {
@@ -62,43 +70,34 @@ export class UserRepository {
       .selectFrom('user_metadata')
       .select(['key', 'value'])
       .where('user_metadata.userId', '=', userId)
-      .execute() as Promise<UserMetadataItem[]>;
-  }
-
-  @GenerateSql()
-  getAdmin() {
-    return this.db
-      .selectFrom('user')
-      .select(columns.userAdmin)
-      .select(withMetadata)
-      .where('user.isAdmin', '=', true)
-      .where('user.deletedAt', 'is', null)
-      .executeTakeFirst();
-  }
-
-  @GenerateSql()
-  getFileSamples() {
-    return this.db
-      .selectFrom('user')
-      .select(['id', 'profileImagePath'])
-      .where('profileImagePath', '!=', sql.lit(''))
-      .limit(sql.lit(3))
       .execute();
   }
 
-  @GenerateSql()
+  async getAdmin() {
+    const user = await this.db
+      .selectFrom('user')
+      .selectAll()
+      .where('user.isAdmin', '=', 1)
+      .where('user.deletedAt', 'is', null)
+      .executeTakeFirst();
+
+    if (!user) return undefined;
+
+    const metadata = await this.getMetadata(user.id);
+    return { ...this.normalizeBooleans(user), metadata };
+  }
+
   async hasAdmin(): Promise<boolean> {
     const admin = await this.db
       .selectFrom('user')
       .select('user.id')
-      .where('user.isAdmin', '=', true)
+      .where('user.isAdmin', '=', 1)
       .where('user.deletedAt', 'is', null)
       .executeTakeFirst();
 
     return !!admin;
   }
 
-  @GenerateSql({ params: [DummyValue.UUID] })
   getForPinCode(id: string) {
     return this.db
       .selectFrom('user')
@@ -108,7 +107,6 @@ export class UserRepository {
       .executeTakeFirstOrThrow();
   }
 
-  @GenerateSql({ params: [DummyValue.UUID] })
   getForChangePassword(id: string) {
     return this.db
       .selectFrom('user')
@@ -118,211 +116,232 @@ export class UserRepository {
       .executeTakeFirstOrThrow();
   }
 
-  @GenerateSql({ params: [DummyValue.EMAIL] })
-  getByEmail(email: string, options?: { withPassword?: boolean }) {
-    return this.db
+  async getByEmail(email: string, options?: { withPassword?: boolean }) {
+    let query = this.db
       .selectFrom('user')
-      .select(columns.userAdmin)
-      .select(withMetadata)
-      .$if(!!options?.withPassword, (eb) => eb.select('password'))
+      .selectAll()
       .where('email', '=', email)
-      .where('user.deletedAt', 'is', null)
-      .executeTakeFirst();
+      .where('user.deletedAt', 'is', null);
+
+    const user = await query.executeTakeFirst();
+    if (!user) return undefined;
+
+    const metadata = await this.getMetadata(user.id);
+    return { ...this.normalizeBooleans(user), metadata };
   }
 
-  @GenerateSql({ params: [DummyValue.STRING] })
-  getByStorageLabel(storageLabel: string) {
+  async getByStorageLabel(storageLabel: string) {
     return this.db
       .selectFrom('user')
-      .select(columns.userAdmin)
+      .selectAll()
       .where('user.storageLabel', '=', storageLabel)
       .where('user.deletedAt', 'is', null)
       .executeTakeFirst();
   }
 
-  @GenerateSql({ params: [DummyValue.STRING] })
-  getByOAuthId(oauthId: string) {
-    return this.db
+  async getByOAuthId(oauthId: string) {
+    const user = await this.db
       .selectFrom('user')
-      .select(columns.userAdmin)
-      .select(withMetadata)
+      .selectAll()
       .where('user.oauthId', '=', oauthId)
       .where('user.deletedAt', 'is', null)
       .executeTakeFirst();
+
+    if (!user) return undefined;
+
+    const metadata = await this.getMetadata(user.id);
+    return { ...this.normalizeBooleans(user), metadata };
   }
 
-  @GenerateSql({ params: [DateTime.now().minus({ years: 1 })] })
-  getDeletedAfter(target: DateTime) {
-    return this.db.selectFrom('user').select(['id']).where('user.deletedAt', '<', target.toJSDate()).execute();
-  }
-
-  @GenerateSql(
-    { name: 'with deleted', params: [{ withDeleted: true }] },
-    { name: 'without deleted', params: [{ withDeleted: false }] },
-  )
-  getList({ id, withDeleted }: UserListFilter = {}) {
-    return this.db
+  async getList({ id, withDeleted }: UserListFilter = {}) {
+    let query = this.db
       .selectFrom('user')
-      .select(columns.userAdmin)
-      .select(withMetadata)
-      .$if(!withDeleted, (eb) => eb.where('user.deletedAt', 'is', null))
-      .$if(!!id, (eb) => eb.where('user.id', '=', id!))
-      .orderBy('createdAt', 'desc')
-      .execute();
+      .selectAll();
+
+    if (!withDeleted) {
+      query = query.where('user.deletedAt', 'is', null);
+    }
+    if (id) {
+      query = query.where('user.id', '=', id);
+    }
+
+    const users = await query.orderBy('createdAt', 'desc').execute();
+
+    return Promise.all(
+      users.map(async (user) => {
+        const metadata = await this.getMetadata(user.id);
+        return { ...this.normalizeBooleans(user), metadata };
+      }),
+    );
   }
 
   async create(dto: Insertable<UserTable>) {
-    return this.db
-      .insertInto('user')
-      .values(dto)
-      .returning(columns.userAdmin)
-      .returning(withMetadata)
+    await this.db.insertInto('user').values(dto).execute();
+
+    // Fetch the created user
+    const user = await this.db
+      .selectFrom('user')
+      .selectAll()
+      .where('user.email', '=', dto.email)
       .executeTakeFirstOrThrow();
+
+    const metadata = await this.getMetadata(user.id);
+    return { ...this.normalizeBooleans(user), metadata };
   }
 
-  update(id: string, dto: Updateable<UserTable>) {
-    return this.db
+  async update(id: string, dto: Updateable<UserTable>) {
+    await this.db
       .updateTable('user')
       .set(dto)
-      .where('user.id', '=', asUuid(id))
+      .where('user.id', '=', id)
       .where('user.deletedAt', 'is', null)
-      .returning(columns.userAdmin)
-      .returning(withMetadata)
+      .execute();
+
+    const user = await this.db
+      .selectFrom('user')
+      .selectAll()
+      .where('user.id', '=', id)
       .executeTakeFirstOrThrow();
+
+    const metadata = await this.getMetadata(user.id);
+    return { ...this.normalizeBooleans(user), metadata };
   }
 
   async updateAll(dto: Updateable<UserTable>) {
     await this.db.updateTable('user').set(dto).execute();
   }
 
-  restore(id: string) {
-    return this.db
-      .updateTable('user')
-      .set({ status: UserStatus.Active, deletedAt: null })
-      .where('user.id', '=', asUuid(id))
-      .returning(columns.userAdmin)
-      .returning(withMetadata)
-      .executeTakeFirstOrThrow();
-  }
-
-  async upsertMetadata<T extends keyof UserMetadata>(id: string, { key, value }: { key: T; value: UserMetadata[T] }) {
+  async restore(id: string) {
     await this.db
-      .insertInto('user_metadata')
-      .values({ userId: id, key, value })
-      .onConflict((oc) =>
-        oc.columns(['userId', 'key']).doUpdateSet({
-          key,
-          value,
-        }),
-      )
+      .updateTable('user')
+      .set({ status: 'active', deletedAt: null })
+      .where('user.id', '=', id)
       .execute();
+
+    const user = await this.db
+      .selectFrom('user')
+      .selectAll()
+      .where('user.id', '=', id)
+      .executeTakeFirstOrThrow();
+
+    const metadata = await this.getMetadata(user.id);
+    return { ...this.normalizeBooleans(user), metadata };
   }
 
-  async deleteMetadata<T extends keyof UserMetadata>(id: string, key: T) {
-    await this.db.deleteFrom('user_metadata').where('userId', '=', id).where('key', '=', key).execute();
+  async upsertMetadata(id: string, { key, value }: { key: string; value: string }) {
+    const existing = await this.db
+      .selectFrom('user_metadata')
+      .select('key')
+      .where('userId', '=', id)
+      .where('key', '=', key)
+      .executeTakeFirst();
+
+    if (existing) {
+      await this.db
+        .updateTable('user_metadata')
+        .set({ value })
+        .where('userId', '=', id)
+        .where('key', '=', key)
+        .execute();
+    } else {
+      await this.db
+        .insertInto('user_metadata')
+        .values({ userId: id, key, value })
+        .execute();
+    }
+  }
+
+  async deleteMetadata(id: string, key: string) {
+    await this.db
+      .deleteFrom('user_metadata')
+      .where('userId', '=', id)
+      .where('key', '=', key)
+      .execute();
   }
 
   delete(user: { id: string }, hard?: boolean) {
     return hard
       ? this.db.deleteFrom('user').where('id', '=', user.id).execute()
-      : this.db.updateTable('user').set({ deletedAt: new Date() }).where('id', '=', user.id).execute();
+      : this.db
+          .updateTable('user')
+          .set({ deletedAt: new Date().toISOString() })
+          .where('id', '=', user.id)
+          .execute();
   }
 
-  @GenerateSql()
-  getUserStats() {
-    return this.db
+  async getUserStats(): Promise<UserStatsQueryResponse[]> {
+    const users = await this.db
       .selectFrom('user')
-      .leftJoin('asset', (join) => join.onRef('asset.ownerId', '=', 'user.id').on('asset.deletedAt', 'is', null))
-      .leftJoin('asset_exif', 'asset_exif.assetId', 'asset.id')
-      .select(['user.id as userId', 'user.name as userName', 'user.quotaSizeInBytes'])
-      .select((eb) => [
-        eb.fn
-          .countAll<number>()
-          .filterWhere((eb) =>
-            eb.and([
-              eb('asset.type', '=', sql.lit(AssetType.Image)),
-              eb('asset.visibility', '!=', sql.lit(AssetVisibility.Hidden)),
-            ]),
-          )
-          .as('photos'),
-        eb.fn
-          .countAll<number>()
-          .filterWhere((eb) =>
-            eb.and([
-              eb('asset.type', '=', sql.lit(AssetType.Video)),
-              eb('asset.visibility', '!=', sql.lit(AssetVisibility.Hidden)),
-            ]),
-          )
-          .as('videos'),
-        eb.fn
-          .coalesce(
-            eb.fn.sum<number>('asset_exif.fileSizeInByte').filterWhere('asset.libraryId', 'is', null),
-            eb.lit(0),
-          )
-          .as('usage'),
-        eb.fn
-          .coalesce(
-            eb.fn
-              .sum<number>('asset_exif.fileSizeInByte')
-              .filterWhere((eb) =>
-                eb.and([eb('asset.libraryId', 'is', null), eb('asset.type', '=', sql.lit(AssetType.Image))]),
-              ),
-            eb.lit(0),
-          )
-          .as('usagePhotos'),
-        eb.fn
-          .coalesce(
-            eb.fn
-              .sum<number>('asset_exif.fileSizeInByte')
-              .filterWhere((eb) =>
-                eb.and([eb('asset.libraryId', 'is', null), eb('asset.type', '=', sql.lit(AssetType.Video))]),
-              ),
-            eb.lit(0),
-          )
-          .as('usageVideos'),
-      ])
-      .groupBy('user.id')
+      .selectAll()
+      .where('user.deletedAt', 'is', null)
       .orderBy('user.createdAt', 'asc')
       .execute();
+
+    const stats: UserStatsQueryResponse[] = [];
+    for (const user of users) {
+      // Get photo count
+      const photoResult = await this.db
+        .selectFrom('asset')
+        .select((eb) => eb.fn.count('asset.id').as('count'))
+        .where('asset.ownerId', '=', user.id)
+        .where('asset.deletedAt', 'is', null)
+        .where('asset.type', '=', 'IMAGE')
+        .where('asset.visibility', '!=', 'hidden')
+        .executeTakeFirst();
+
+      // Get video count
+      const videoResult = await this.db
+        .selectFrom('asset')
+        .select((eb) => eb.fn.count('asset.id').as('count'))
+        .where('asset.ownerId', '=', user.id)
+        .where('asset.deletedAt', 'is', null)
+        .where('asset.type', '=', 'VIDEO')
+        .where('asset.visibility', '!=', 'hidden')
+        .executeTakeFirst();
+
+      // Get usage
+      const usageResult = await this.db
+        .selectFrom('asset')
+        .leftJoin('asset_exif', 'asset_exif.assetId', 'asset.id')
+        .select((eb) => eb.fn.coalesce(eb.fn.sum('asset_exif.fileSizeInByte'), sql`0`).as('usage'))
+        .where('asset.ownerId', '=', user.id)
+        .where('asset.deletedAt', 'is', null)
+        .where('asset.libraryId', 'is', null)
+        .executeTakeFirst();
+
+      stats.push({
+        userId: user.id,
+        userName: user.name as string,
+        photos: Number(photoResult?.count ?? 0),
+        videos: Number(videoResult?.count ?? 0),
+        usage: Number(usageResult?.usage ?? 0),
+        usagePhotos: 0,
+        usageVideos: 0,
+        quotaSizeInBytes: user.quotaSizeInBytes,
+      });
+    }
+
+    return stats;
   }
 
-  @GenerateSql()
   async getCount(): Promise<number> {
     const result = await this.db
       .selectFrom('user')
-      .select((eb) => eb.fn.countAll().as('count'))
+      .select((eb) => eb.fn.count('user.id').as('count'))
       .where('user.deletedAt', 'is', null)
       .executeTakeFirstOrThrow();
     return Number(result.count);
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, DummyValue.NUMBER] })
   async updateUsage(id: string, delta: number): Promise<void> {
     await this.db
       .updateTable('user')
-      .set({ quotaUsageInBytes: sql`"quotaUsageInBytes" + ${delta}`, updatedAt: new Date() })
-      .where('id', '=', asUuid(id))
+      .set({
+        quotaUsageInBytes: sql`"quotaUsageInBytes" + ${delta}`,
+        updatedAt: new Date().toISOString(),
+      })
+      .where('id', '=', id)
       .where('user.deletedAt', 'is', null)
       .execute();
-  }
-
-  @GenerateSql({ params: [DummyValue.UUID] })
-  async syncUsage(id?: string) {
-    const query = this.db
-      .updateTable('user')
-      .set({
-        quotaUsageInBytes: (eb) =>
-          eb
-            .selectFrom('asset')
-            .leftJoin('asset_exif', 'asset_exif.assetId', 'asset.id')
-            .select((eb) => eb.fn.coalesce(eb.fn.sum<number>('asset_exif.fileSizeInByte'), eb.lit(0)).as('usage'))
-            .where('asset.libraryId', 'is', null)
-            .where('asset.ownerId', '=', eb.ref('user.id')),
-        updatedAt: new Date(),
-      })
-      .where('user.deletedAt', 'is', null)
-      .$if(id != undefined, (eb) => eb.where('user.id', '=', asUuid(id!)));
-
-    await query.execute();
   }
 }

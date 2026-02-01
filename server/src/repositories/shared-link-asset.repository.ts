@@ -1,33 +1,38 @@
-import { Kysely } from 'kysely';
-import { InjectKysely } from 'nestjs-kysely';
-import { DummyValue, GenerateSql } from 'src/decorators';
-import { DB } from 'src/schema';
+/**
+ * Shared Link Asset repository -- Workers/D1-compatible version.
+ *
+ * No @InjectKysely, no decorators. Plain Kysely with D1 dialect.
+ */
+
+import type { Kysely } from 'kysely';
+import type { DB } from 'src/schema';
 
 export class SharedLinkAssetRepository {
-  constructor(@InjectKysely() private db: Kysely<DB>) {}
+  constructor(private db: Kysely<DB>) {}
 
-  async remove(sharedLinkId: string, assetId: string[]) {
-    const deleted = await this.db
-      .deleteFrom('shared_link_asset')
+  async remove(sharedLinkId: string, assetIds: string[]): Promise<string[]> {
+    if (assetIds.length === 0) {
+      return [];
+    }
+
+    // D1 doesn't reliably support RETURNING, so fetch first then delete
+    const existing = await this.db
+      .selectFrom('shared_link_asset')
+      .select('assetId')
       .where('shared_link_asset.sharedLinkId', '=', sharedLinkId)
-      .where('shared_link_asset.assetId', 'in', assetId)
-      .returning('assetId')
+      .where('shared_link_asset.assetId', 'in', assetIds)
       .execute();
 
-    return deleted.map((row) => row.assetId);
-  }
+    const existingIds = existing.map((row) => row.assetId);
 
-  @GenerateSql({ params: [{ sourceAssetId: DummyValue.UUID, targetAssetId: DummyValue.UUID }] })
-  async copySharedLinks({ sourceAssetId, targetAssetId }: { sourceAssetId: string; targetAssetId: string }) {
-    return this.db
-      .insertInto('shared_link_asset')
-      .expression((eb) =>
-        eb
-          .selectFrom('shared_link_asset')
-          .select((eb) => [eb.val(targetAssetId).as('assetId'), 'shared_link_asset.sharedLinkId'])
-          .where('shared_link_asset.assetId', '=', sourceAssetId),
-      )
-      .onConflict((oc) => oc.doNothing())
-      .execute();
+    if (existingIds.length > 0) {
+      await this.db
+        .deleteFrom('shared_link_asset')
+        .where('shared_link_asset.sharedLinkId', '=', sharedLinkId)
+        .where('shared_link_asset.assetId', 'in', existingIds)
+        .execute();
+    }
+
+    return existingIds;
   }
 }

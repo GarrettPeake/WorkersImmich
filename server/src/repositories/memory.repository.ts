@@ -1,173 +1,255 @@
-import { Injectable } from '@nestjs/common';
-import { Insertable, Kysely, OrderByDirection, sql, Updateable } from 'kysely';
-import { jsonArrayFrom } from 'kysely/helpers/postgres';
-import { DateTime } from 'luxon';
-import { InjectKysely } from 'nestjs-kysely';
-import { Chunked, ChunkedSet, DummyValue, GenerateSql } from 'src/decorators';
-import { MemorySearchDto } from 'src/dtos/memory.dto';
-import { AssetOrderWithRandom, AssetVisibility } from 'src/enum';
-import { DB } from 'src/schema';
-import { MemoryTable } from 'src/schema/tables/memory.table';
-import { IBulkAsset } from 'src/types';
+/**
+ * Memory repository -- Workers/D1-compatible version.
+ *
+ * Converted from PostgreSQL to D1/SQLite-compatible Kysely queries.
+ * Key changes:
+ * - No jsonArrayFrom from kysely/helpers/postgres
+ * - No luxon DateTime -- use plain Date/string
+ * - No @Injectable, @InjectKysely, @GenerateSql, @Chunked decorators
+ * - Separate queries for assets instead of nested json builders
+ */
 
-@Injectable()
-export class MemoryRepository implements IBulkAsset {
-  constructor(@InjectKysely() private db: Kysely<DB>) {}
+import type { Insertable, Kysely, Updateable } from 'kysely';
+import { sql } from 'kysely';
+import type { DB, MemoryTable } from 'src/schema';
 
-  async cleanup() {
-    await this.db
-      .deleteFrom('memory_asset')
-      .using('asset')
-      .whereRef('memory_asset.assetId', '=', 'asset.id')
-      .where('asset.visibility', '!=', AssetVisibility.Timeline)
-      .execute();
+const CHUNK_SIZE = 500;
 
-    return this.db
-      .deleteFrom('memory')
-      .where('createdAt', '<', DateTime.now().minus({ days: 30 }).toJSDate())
-      .where('isSaved', '=', false)
-      .execute();
-  }
+export class MemoryRepository {
+  constructor(private db: Kysely<DB>) {}
 
-  searchBuilder(ownerId: string, dto: MemorySearchDto) {
-    return this.db
+  async search(ownerId: string, dto: any) {
+    let query = this.db
       .selectFrom('memory')
-      .$if(dto.isSaved !== undefined, (qb) => qb.where('isSaved', '=', dto.isSaved!))
-      .$if(dto.type !== undefined, (qb) => qb.where('type', '=', dto.type!))
-      .$if(dto.for !== undefined, (qb) =>
-        qb
-          .where((where) => where.or([where('showAt', 'is', null), where('showAt', '<=', dto.for!)]))
-          .where((where) => where.or([where('hideAt', 'is', null), where('hideAt', '>=', dto.for!)])),
-      )
-      .where('deletedAt', dto.isTrashed ? 'is not' : 'is', null)
-      .where('ownerId', '=', ownerId);
-  }
-
-  @GenerateSql(
-    { params: [DummyValue.UUID, {}] },
-    { name: 'date filter', params: [DummyValue.UUID, { for: DummyValue.DATE }] },
-  )
-  statistics(ownerId: string, dto: MemorySearchDto) {
-    return this.searchBuilder(ownerId, dto)
-      .select((qb) => qb.fn.countAll<number>().as('total'))
-      .executeTakeFirstOrThrow();
-  }
-
-  @GenerateSql(
-    { params: [DummyValue.UUID, {}] },
-    { name: 'date filter', params: [DummyValue.UUID, { for: DummyValue.DATE }] },
-  )
-  search(ownerId: string, dto: MemorySearchDto) {
-    return this.searchBuilder(ownerId, dto)
-      .select((eb) =>
-        jsonArrayFrom(
-          eb
-            .selectFrom('asset')
-            .selectAll('asset')
-            .innerJoin('memory_asset', 'asset.id', 'memory_asset.assetId')
-            .whereRef('memory_asset.memoriesId', '=', 'memory.id')
-            .orderBy('asset.fileCreatedAt', 'asc')
-            .where('asset.visibility', '=', sql.lit(AssetVisibility.Timeline))
-            .where('asset.deletedAt', 'is', null),
-        ).as('assets'),
-      )
       .selectAll('memory')
-      .$call((qb) =>
-        dto.order === AssetOrderWithRandom.Random
-          ? qb.orderBy(sql`RANDOM()`)
-          : qb.orderBy('memoryAt', (dto.order?.toLowerCase() || 'desc') as OrderByDirection),
-      )
-      .$if(dto.size !== undefined, (qb) => qb.limit(dto.size!))
+      .where('ownerId', '=', ownerId);
+
+    if (dto.isSaved !== undefined) {
+      query = query.where('isSaved', '=', dto.isSaved ? 1 : 0);
+    }
+    if (dto.type !== undefined) {
+      query = query.where('type', '=', dto.type);
+    }
+    if (dto.for !== undefined) {
+      query = query
+        .where((eb) => eb.or([eb('showAt', 'is', null), eb('showAt', '<=', dto.for)]))
+        .where((eb) => eb.or([eb('hideAt', 'is', null), eb('hideAt', '>=', dto.for)]));
+    }
+
+    const isTrashed = dto.isTrashed ?? false;
+    if (isTrashed) {
+      query = query.where('deletedAt', 'is not', null);
+    } else {
+      query = query.where('deletedAt', 'is', null);
+    }
+
+    if (dto.order === 'random') {
+      query = query.orderBy(sql`RANDOM()`);
+    } else {
+      query = query.orderBy('memoryAt', dto.order?.toLowerCase() || 'desc');
+    }
+
+    if (dto.size !== undefined) {
+      query = query.limit(dto.size);
+    }
+
+    const memories = await query.execute();
+    return this.enrichMemories(memories);
+  }
+
+  async statistics(ownerId: string, dto: any) {
+    let query = this.db
+      .selectFrom('memory')
+      .where('ownerId', '=', ownerId);
+
+    if (dto.isSaved !== undefined) {
+      query = query.where('isSaved', '=', dto.isSaved ? 1 : 0);
+    }
+    if (dto.type !== undefined) {
+      query = query.where('type', '=', dto.type);
+    }
+    if (dto.for !== undefined) {
+      query = query
+        .where((eb) => eb.or([eb('showAt', 'is', null), eb('showAt', '<=', dto.for)]))
+        .where((eb) => eb.or([eb('hideAt', 'is', null), eb('hideAt', '>=', dto.for)]));
+    }
+
+    const isTrashed = dto.isTrashed ?? false;
+    if (isTrashed) {
+      query = query.where('deletedAt', 'is not', null);
+    } else {
+      query = query.where('deletedAt', 'is', null);
+    }
+
+    const result = await query
+      .select((eb) => eb.fn.count('id').as('total'))
+      .executeTakeFirstOrThrow();
+
+    return { total: Number(result.total) };
+  }
+
+  async get(id: string) {
+    const memory = await this.db
+      .selectFrom('memory')
+      .selectAll('memory')
+      .where('id', '=', id)
+      .where('deletedAt', 'is', null)
+      .executeTakeFirst();
+
+    if (!memory) {
+      return undefined;
+    }
+
+    const assets = await this.db
+      .selectFrom('asset')
+      .selectAll('asset')
+      .innerJoin('memory_asset', 'asset.id', 'memory_asset.assetId')
+      .where('memory_asset.memoriesId', '=', id)
+      .where('asset.visibility', '=', 'timeline')
+      .where('asset.deletedAt', 'is', null)
+      .orderBy('asset.fileCreatedAt', 'asc')
       .execute();
+
+    return { ...memory, assets };
   }
 
-  @GenerateSql({ params: [DummyValue.UUID] })
-  get(id: string) {
-    return this.getByIdBuilder(id).executeTakeFirst();
-  }
+  async create(memory: Insertable<MemoryTable>, assetIds: string[] | Set<string>) {
+    const assetIdArray = assetIds instanceof Set ? [...assetIds] : assetIds;
 
-  async create(memory: Insertable<MemoryTable>, assetIds: Set<string>) {
-    const id = await this.db.transaction().execute(async (tx) => {
-      const { id } = await tx.insertInto('memory').values(memory).returning('id').executeTakeFirstOrThrow();
+    return this.db.transaction().execute(async (tx) => {
+      const rows = await tx
+        .insertInto('memory')
+        .values(memory)
+        .returning('id')
+        .execute();
 
-      if (assetIds.size > 0) {
-        const values = [...assetIds].map((assetId) => ({ memoriesId: id, assetId }));
+      const id = rows[0]?.id;
+      if (!id) {
+        throw new Error('Failed to create memory');
+      }
+
+      if (assetIdArray.length > 0) {
+        const values = assetIdArray.map((assetId) => ({ memoriesId: id, assetId }));
         await tx.insertInto('memory_asset').values(values).execute();
       }
 
-      return id;
-    });
+      // Fetch the created memory with assets
+      const created = await tx
+        .selectFrom('memory')
+        .selectAll('memory')
+        .where('id', '=', id)
+        .executeTakeFirstOrThrow();
 
-    return this.getByIdBuilder(id).executeTakeFirstOrThrow();
+      const assets = await tx
+        .selectFrom('asset')
+        .selectAll('asset')
+        .innerJoin('memory_asset', 'asset.id', 'memory_asset.assetId')
+        .where('memory_asset.memoriesId', '=', id)
+        .where('asset.visibility', '=', 'timeline')
+        .where('asset.deletedAt', 'is', null)
+        .orderBy('asset.fileCreatedAt', 'asc')
+        .execute();
+
+      return { ...created, assets };
+    });
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, { ownerId: DummyValue.UUID, isSaved: true }] })
   async update(id: string, memory: Updateable<MemoryTable>) {
     await this.db.updateTable('memory').set(memory).where('id', '=', id).execute();
-    return this.getByIdBuilder(id).executeTakeFirstOrThrow();
+
+    const updated = await this.db
+      .selectFrom('memory')
+      .selectAll('memory')
+      .where('id', '=', id)
+      .executeTakeFirstOrThrow();
+
+    const assets = await this.db
+      .selectFrom('asset')
+      .selectAll('asset')
+      .innerJoin('memory_asset', 'asset.id', 'memory_asset.assetId')
+      .where('memory_asset.memoriesId', '=', id)
+      .where('asset.visibility', '=', 'timeline')
+      .where('asset.deletedAt', 'is', null)
+      .orderBy('asset.fileCreatedAt', 'asc')
+      .execute();
+
+    return { ...updated, assets };
   }
 
-  @GenerateSql({ params: [DummyValue.UUID] })
   async delete(id: string) {
     await this.db.deleteFrom('memory').where('id', '=', id).execute();
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, [DummyValue.UUID]] })
-  @ChunkedSet({ paramIndex: 1 })
-  async getAssetIds(id: string, assetIds: string[]) {
+  async getAssetIds(id: string, assetIds: string[]): Promise<Set<string>> {
     if (assetIds.length === 0) {
       return new Set<string>();
     }
 
-    const results = await this.db
-      .selectFrom('memory_asset')
-      .select(['assetId'])
-      .where('memoriesId', '=', id)
-      .where('assetId', 'in', assetIds)
-      .execute();
+    const allResults: string[] = [];
+    for (let i = 0; i < assetIds.length; i += CHUNK_SIZE) {
+      const chunk = assetIds.slice(i, i + CHUNK_SIZE);
+      const results = await this.db
+        .selectFrom('memory_asset')
+        .select('assetId')
+        .where('memoriesId', '=', id)
+        .where('assetId', 'in', chunk)
+        .execute();
+      for (const r of results) {
+        allResults.push(r.assetId);
+      }
+    }
 
-    return new Set(results.map(({ assetId }) => assetId));
+    return new Set(allResults);
   }
 
-  @GenerateSql({ params: [DummyValue.UUID, [DummyValue.UUID]] })
   async addAssetIds(id: string, assetIds: string[]) {
     if (assetIds.length === 0) {
       return;
     }
 
-    await this.db
-      .insertInto('memory_asset')
-      .values(assetIds.map((assetId) => ({ memoriesId: id, assetId })))
-      .execute();
+    for (let i = 0; i < assetIds.length; i += CHUNK_SIZE) {
+      const chunk = assetIds.slice(i, i + CHUNK_SIZE);
+      await this.db
+        .insertInto('memory_asset')
+        .values(chunk.map((assetId) => ({ memoriesId: id, assetId })))
+        .execute();
+    }
   }
 
-  @Chunked({ paramIndex: 1 })
-  @GenerateSql({ params: [DummyValue.UUID, [DummyValue.UUID]] })
   async removeAssetIds(id: string, assetIds: string[]) {
     if (assetIds.length === 0) {
       return;
     }
 
-    await this.db.deleteFrom('memory_asset').where('memoriesId', '=', id).where('assetId', 'in', assetIds).execute();
+    for (let i = 0; i < assetIds.length; i += CHUNK_SIZE) {
+      const chunk = assetIds.slice(i, i + CHUNK_SIZE);
+      await this.db
+        .deleteFrom('memory_asset')
+        .where('memoriesId', '=', id)
+        .where('assetId', 'in', chunk)
+        .execute();
+    }
   }
 
-  private getByIdBuilder(id: string) {
-    return this.db
-      .selectFrom('memory')
-      .selectAll('memory')
-      .select((eb) =>
-        jsonArrayFrom(
-          eb
-            .selectFrom('asset')
-            .selectAll('asset')
-            .innerJoin('memory_asset', 'asset.id', 'memory_asset.assetId')
-            .whereRef('memory_asset.memoriesId', '=', 'memory.id')
-            .orderBy('asset.fileCreatedAt', 'asc')
-            .where('asset.visibility', '=', sql.lit(AssetVisibility.Timeline))
-            .where('asset.deletedAt', 'is', null),
-        ).as('assets'),
-      )
-      .where('id', '=', id)
-      .where('deletedAt', 'is', null);
+  // -------------------------------------------------------------------------
+  // Private helpers
+  // -------------------------------------------------------------------------
+
+  private async enrichMemories(memories: any[]) {
+    return Promise.all(
+      memories.map(async (memory) => {
+        const assets = await this.db
+          .selectFrom('asset')
+          .selectAll('asset')
+          .innerJoin('memory_asset', 'asset.id', 'memory_asset.assetId')
+          .where('memory_asset.memoriesId', '=', memory.id)
+          .where('asset.visibility', '=', 'timeline')
+          .where('asset.deletedAt', 'is', null)
+          .orderBy('asset.fileCreatedAt', 'asc')
+          .execute();
+
+        return { ...memory, assets };
+      }),
+    );
   }
 }

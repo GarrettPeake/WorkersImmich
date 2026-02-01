@@ -1,147 +1,83 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsString } from 'class-validator';
+import { z } from 'zod';
 import { SharedLink } from 'src/database';
-import { HistoryBuilder } from 'src/decorators';
 import { AlbumResponseDto, mapAlbumWithoutAssets } from 'src/dtos/album.dto';
 import { AssetResponseDto, mapAsset } from 'src/dtos/asset-response.dto';
 import { SharedLinkType } from 'src/enum';
-import { Optional, ValidateBoolean, ValidateDate, ValidateEnum, ValidateUUID } from 'src/validation';
+import { optionalBooleanQuery } from 'src/validation';
 
-export class SharedLinkSearchDto {
-  @ValidateUUID({ optional: true, description: 'Filter by album ID' })
-  albumId?: string;
+// --- Request Schemas ---
 
-  @ValidateUUID({
-    optional: true,
-    description: 'Filter by shared link ID',
-    history: new HistoryBuilder().added('v2.5.0'),
-  })
-  id?: string;
-}
+export const SharedLinkSearchSchema = z.object({
+  albumId: z.string().uuid().optional(),
+  id: z.string().uuid().optional(),
+});
+export type SharedLinkSearchDto = z.infer<typeof SharedLinkSearchSchema>;
 
-export class SharedLinkCreateDto {
-  @ValidateEnum({ enum: SharedLinkType, name: 'SharedLinkType', description: 'Shared link type' })
-  type!: SharedLinkType;
+export const SharedLinkCreateSchema = z.object({
+  type: z.nativeEnum(SharedLinkType),
+  assetIds: z.array(z.string().uuid()).optional(),
+  albumId: z.string().uuid().optional(),
+  description: z.string().nullable().optional().transform((v) => (v === '' ? null : v)),
+  password: z.string().nullable().optional().transform((v) => (v === '' ? null : v)),
+  slug: z.string().nullable().optional().transform((v) => (v === '' ? null : v)),
+  expiresAt: z.coerce.date().nullable().optional().default(null),
+  allowUpload: z.preprocess((val) => {
+    if (val === 'true' || val === true) return true;
+    if (val === 'false' || val === false) return false;
+    return val;
+  }, z.boolean().optional()),
+  allowDownload: z.preprocess((val) => {
+    if (val === 'true' || val === true) return true;
+    if (val === 'false' || val === false) return false;
+    return val;
+  }, z.boolean().optional().default(true)),
+  showMetadata: z.preprocess((val) => {
+    if (val === 'true' || val === true) return true;
+    if (val === 'false' || val === false) return false;
+    return val;
+  }, z.boolean().optional().default(true)),
+});
+export type SharedLinkCreateDto = z.infer<typeof SharedLinkCreateSchema>;
 
-  @ValidateUUID({ each: true, optional: true, description: 'Asset IDs (for individual assets)' })
-  assetIds?: string[];
+export const SharedLinkEditSchema = z.object({
+  description: z.string().nullable().optional().transform((v) => (v === '' ? null : v)),
+  password: z.string().nullable().optional().transform((v) => (v === '' ? null : v)),
+  slug: z.string().nullable().optional().transform((v) => (v === '' ? null : v)),
+  expiresAt: z.coerce.date().nullable().optional(),
+  allowUpload: optionalBooleanQuery,
+  allowDownload: optionalBooleanQuery,
+  showMetadata: optionalBooleanQuery,
+  changeExpiryTime: optionalBooleanQuery,
+});
+export type SharedLinkEditDto = z.infer<typeof SharedLinkEditSchema>;
 
-  @ValidateUUID({ optional: true, description: 'Album ID (for album sharing)' })
-  albumId?: string;
+export const SharedLinkPasswordSchema = z.object({
+  password: z.string().optional(),
+  token: z.string().optional(),
+});
+export type SharedLinkPasswordDto = z.infer<typeof SharedLinkPasswordSchema>;
 
-  @ApiPropertyOptional({ description: 'Link description' })
-  @Optional({ nullable: true, emptyToNull: true })
-  @IsString()
-  description?: string | null;
+// --- Response DTOs (plain interfaces) ---
 
-  @ApiPropertyOptional({ description: 'Link password' })
-  @Optional({ nullable: true, emptyToNull: true })
-  @IsString()
-  password?: string | null;
-
-  @ApiPropertyOptional({ description: 'Custom URL slug' })
-  @Optional({ nullable: true, emptyToNull: true })
-  @IsString()
-  slug?: string | null;
-
-  @ValidateDate({ optional: true, description: 'Expiration date' })
-  expiresAt?: Date | null = null;
-
-  @ValidateBoolean({ optional: true, description: 'Allow uploads' })
-  allowUpload?: boolean;
-
-  @ValidateBoolean({ optional: true, description: 'Allow downloads', default: true })
-  allowDownload?: boolean = true;
-
-  @ValidateBoolean({ optional: true, description: 'Show metadata', default: true })
-  showMetadata?: boolean = true;
-}
-
-export class SharedLinkEditDto {
-  @ApiPropertyOptional({ description: 'Link description' })
-  @Optional({ nullable: true, emptyToNull: true })
-  @IsString()
-  description?: string | null;
-
-  @ApiPropertyOptional({ description: 'Link password' })
-  @Optional({ nullable: true, emptyToNull: true })
-  @IsString()
-  password?: string | null;
-
-  @ApiPropertyOptional({ description: 'Custom URL slug' })
-  @Optional({ nullable: true, emptyToNull: true })
-  @IsString()
-  slug?: string | null;
-
-  @ApiPropertyOptional({ description: 'Expiration date' })
-  @Optional({ nullable: true })
-  expiresAt?: Date | null;
-
-  @ValidateBoolean({ optional: true, description: 'Allow uploads' })
-  allowUpload?: boolean;
-
-  @ValidateBoolean({ optional: true, description: 'Allow downloads' })
-  allowDownload?: boolean;
-
-  @ValidateBoolean({ optional: true, description: 'Show metadata' })
-  showMetadata?: boolean;
-
-  @ValidateBoolean({
-    optional: true,
-    description:
-      'Whether to change the expiry time. Few clients cannot send null to set the expiryTime to never. Setting this flag and not sending expiryAt is considered as null instead. Clients that can send null values can ignore this.',
-  })
-  changeExpiryTime?: boolean;
-}
-
-export class SharedLinkPasswordDto {
-  @ApiPropertyOptional({ example: 'password', description: 'Link password' })
-  @IsString()
-  @Optional()
-  password?: string;
-
-  @ApiPropertyOptional({ description: 'Access token' })
-  @IsString()
-  @Optional()
-  token?: string;
-}
-export class SharedLinkResponseDto {
-  @ApiProperty({ description: 'Shared link ID' })
-  id!: string;
-  @ApiProperty({ description: 'Link description' })
-  description!: string | null;
-  @ApiProperty({ description: 'Has password' })
-  password!: string | null;
-  @ApiPropertyOptional({ description: 'Access token' })
+export interface SharedLinkResponseDto {
+  id: string;
+  description: string | null;
+  password: string | null;
   token?: string | null;
-  @ApiProperty({ description: 'Owner user ID' })
-  userId!: string;
-  @ApiProperty({ description: 'Encryption key (base64url)' })
-  key!: string;
-
-  @ValidateEnum({ enum: SharedLinkType, name: 'SharedLinkType', description: 'Shared link type' })
-  type!: SharedLinkType;
-  @ApiProperty({ description: 'Creation date' })
-  createdAt!: Date;
-  @ApiProperty({ description: 'Expiration date' })
-  expiresAt!: Date | null;
-  // Description lives on schema to avoid duplication
-  @ApiProperty({ description: undefined })
-  assets!: AssetResponseDto[];
-  // Description lives on schema to avoid duplication
-  @ApiPropertyOptional({ description: undefined })
+  userId: string;
+  key: string;
+  type: SharedLinkType;
+  createdAt: Date;
+  expiresAt: Date | null;
+  assets: AssetResponseDto[];
   album?: AlbumResponseDto;
-  @ApiProperty({ description: 'Allow uploads' })
-  allowUpload!: boolean;
-
-  @ApiProperty({ description: 'Allow downloads' })
-  allowDownload!: boolean;
-  @ApiProperty({ description: 'Show metadata' })
-  showMetadata!: boolean;
-
-  @ApiProperty({ description: 'Custom URL slug' })
-  slug!: string | null;
+  allowUpload: boolean;
+  allowDownload: boolean;
+  showMetadata: boolean;
+  slug: string | null;
 }
+
+// --- Mapper ---
 
 export function mapSharedLink(sharedLink: SharedLink, options: { stripAssetMetadata: boolean }): SharedLinkResponseDto {
   const assets = sharedLink.assets || [];

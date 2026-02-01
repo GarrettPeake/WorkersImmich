@@ -1,66 +1,49 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsHexColor, IsNotEmpty, IsString } from 'class-validator';
+import { z } from 'zod';
 import { Tag } from 'src/database';
-import { Optional, ValidateHexColor, ValidateUUID } from 'src/validation';
+import { hexColor } from 'src/validation';
 
-export class TagCreateDto {
-  @ApiProperty({ description: 'Tag name' })
-  @IsString()
-  @IsNotEmpty()
-  name!: string;
+// --- Request Schemas ---
 
-  @ValidateUUID({ optional: true, description: 'Parent tag ID' })
-  parentId?: string | null;
+export const TagCreateSchema = z.object({
+  name: z.string().min(1),
+  parentId: z.string().uuid().nullable().optional(),
+  color: hexColor.nullable().optional().transform((v) => (v === '' ? null : v)),
+});
+export type TagCreateDto = z.infer<typeof TagCreateSchema>;
 
-  @ApiPropertyOptional({ description: 'Tag color (hex)' })
-  @IsHexColor()
-  @Optional({ nullable: true, emptyToNull: true })
-  color?: string;
+export const TagUpdateSchema = z.object({
+  color: hexColor.nullable().optional().transform((v) => (v === '' ? null : v)),
+});
+export type TagUpdateDto = z.infer<typeof TagUpdateSchema>;
+
+export const TagUpsertSchema = z.object({
+  tags: z.array(z.string().min(1)).min(1),
+});
+export type TagUpsertDto = z.infer<typeof TagUpsertSchema>;
+
+export const TagBulkAssetsSchema = z.object({
+  tagIds: z.array(z.string().uuid()).min(1),
+  assetIds: z.array(z.string().uuid()).min(1),
+});
+export type TagBulkAssetsDto = z.infer<typeof TagBulkAssetsSchema>;
+
+// --- Response DTOs (plain interfaces) ---
+
+export interface TagBulkAssetsResponseDto {
+  count: number;
 }
 
-export class TagUpdateDto {
-  @ApiPropertyOptional({ description: 'Tag color (hex)' })
-  @Optional({ emptyToNull: true })
-  @ValidateHexColor()
-  color?: string | null;
-}
-
-export class TagUpsertDto {
-  @ApiProperty({ description: 'Tag names to upsert' })
-  @IsString({ each: true })
-  @IsNotEmpty({ each: true })
-  tags!: string[];
-}
-
-export class TagBulkAssetsDto {
-  @ValidateUUID({ each: true, description: 'Tag IDs' })
-  tagIds!: string[];
-
-  @ValidateUUID({ each: true, description: 'Asset IDs' })
-  assetIds!: string[];
-}
-
-export class TagBulkAssetsResponseDto {
-  @ApiProperty({ type: 'integer', description: 'Number of assets tagged' })
-  count!: number;
-}
-
-export class TagResponseDto {
-  @ApiProperty({ description: 'Tag ID' })
-  id!: string;
-  @ApiPropertyOptional({ description: 'Parent tag ID' })
+export interface TagResponseDto {
+  id: string;
   parentId?: string;
-  @ApiProperty({ description: 'Tag name' })
-  name!: string;
-  @ApiProperty({ description: 'Tag value (full path)' })
-  value!: string;
-  @ApiProperty({ description: 'Creation date' })
-  createdAt!: Date;
-  @ApiProperty({ description: 'Last update date' })
-  updatedAt!: Date;
-  @ApiPropertyOptional({ description: 'Tag color (hex)' })
+  name: string;
+  value: string;
+  createdAt: Date;
+  updatedAt: Date;
   color?: string;
 }
+
+// --- Mapper ---
 
 export function mapTag(entity: Tag): TagResponseDto {
   return {

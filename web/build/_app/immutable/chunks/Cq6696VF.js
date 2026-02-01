@@ -1,0 +1,1 @@
+import"./DsnmJJEf.js";import{o as a}from"./C8vxa4mj.js";import{p,a as i}from"./D0CSSuTl.js";import{r as m}from"./zonMEKN6.js";import{e as c}from"./BpCm29KX.js";function g(f,o){p(o,!0);const n=m(o,["$$slots","$$events","$$legacy"]);a(()=>{const t={};for(const[r,e]of Object.entries(n))if(e){const s=r.slice(2);t[s]=e}return c.on(t)}),i()}export{g as O};
