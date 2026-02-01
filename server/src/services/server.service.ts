@@ -8,7 +8,7 @@
 import type { ServiceContext } from 'src/context';
 import { UserRepository } from 'src/repositories/user.repository';
 
-const SERVER_VERSION = { major: 1, minor: 132, patch: 0 };
+const SERVER_VERSION = { major: 2, minor: 52, patch: 0 };
 
 export class ServerService {
   private userRepository: UserRepository;
